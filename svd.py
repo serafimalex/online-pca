@@ -59,7 +59,6 @@ def approx_svd(trueX, p, g, utrue = None):
 
             scores[i][j] = s[0] - x[i][i]
     
-    print(scores)
     for q in range(g):
         # get max score from matrix
         iq, jq = np.unravel_index(np.argmax(scores), scores.shape)
