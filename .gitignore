@@ -1,0 +1,10 @@
+# Ignore .conda directories
+.conda/
+**/.conda/
+
+# Ignore __pycache__ directories
+__pycache__/
+**/__pycache__/
+
+# Ignore .pyc files
+*.pyc

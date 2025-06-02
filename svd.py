@@ -134,7 +134,7 @@ def approx_svd(trueX, p, g, utrue = None):
         traces = np.append(traces,  np.trace(x[:p, :p]))
     
     
-    return traces
+    return traces, u, x
 
 
             
