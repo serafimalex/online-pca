@@ -6,6 +6,8 @@ import logging
 import time
 from time import perf_counter
 import math
+from joblib import Parallel, delayed
+
 np.set_printoptions(suppress=True, precision = 4, linewidth = 200)
 
 class catchtime:
@@ -78,6 +80,21 @@ class ApproxSVD():
         x[j, :] = m[1][0] * row_i + m[1][1] * row_j
 
 
+    def compute_score(self, i, j, x, d):
+        if j >= d:
+            xji = 0
+            xjj = 0
+        else:
+            xji = x[j][i]
+            xjj = x[j][j]
+
+        if x[i][j] * xjj - x[i][j] * xji >= 0:
+            value = math.sqrt((x[i][i] + xjj)**2 + (x[i][j] - xji)**2) - x[i][i] - xjj
+        else:
+            value = math.sqrt((x[i][i] - xjj)**2 + (x[i][j] + xji)**2) - x[i][i] - xjj
+
+        return (i, j, value)
+
 
     def fit(self, trueX):
         d = trueX.shape[0]
@@ -90,23 +107,14 @@ class ApproxSVD():
         with catchtime(self.debug_mode, self.logger, "total time"):
         
             with catchtime(self.debug_mode, self.logger, "initial scores"):
-                for i in range(self.p):
-                    for j in range(i + 1, n):
-                        if j >= d:
-                            xji = 0
-                            xjj = 0 
-                        else:
-                            xji = x[j][i]
-                            xjj = x[j][j]
+                results = Parallel(n_jobs=-1, prefer="processes")(
+                    delayed(self.compute_score)(i, j, x, d)
+                    for i in range(self.p)
+                    for j in range(i + 1, n)
+                )
 
-                        # t = np.array([[x[i][i], x[i][j]],
-                        #             [xji, xjj]])
-                        # _, s, _ = np.linalg.svd(t)
-
-                        if x[i][j] * xjj - x[i][j] *xji >= 0:
-                            scores[i][j] = math.sqrt((x[i][i] + xjj)**2 + (x[i][j] - xji)**2) - x[i][i] - xjj
-                        else:
-                            scores[i][j] = math.sqrt((x[i][i] - xjj)**2 + (x[i][j] + xji)**2) - x[i][i] - xjj
+            for i, j, value in results:
+                scores[i][j] = value
             
             for q in range(self.n_iter):
                 # get max score from matrix
