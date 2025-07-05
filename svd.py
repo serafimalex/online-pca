@@ -107,7 +107,7 @@ class ApproxSVD():
         with catchtime(self.debug_mode, self.logger, "total time"):
         
             with catchtime(self.debug_mode, self.logger, "initial scores"):
-                results = Parallel(n_jobs=-1, prefer="processes")(
+                results = Parallel(n_jobs=1, prefer="processes")(
                     delayed(self.compute_score)(i, j, x, d)
                     for i in range(self.p)
                     for j in range(i + 1, n)
@@ -144,16 +144,16 @@ class ApproxSVD():
                 with catchtime(self.debug_mode, self.logger, "update scores"):
                     # update scores
                     for s in range(iq + 1, d):
-                        # t = np.array([
-                        #                 [x[iq][iq], x[iq][s]],
-                        #                 [x[s][iq], x[s][s]]
-                        #             ])
-                        # _, sig, _ = np.linalg.svd(t)
-                        # scores[iq][s] = sig[0] - x[iq][iq]
-                        if x[iq][iq] * x[s][s] - x[iq][s] *x[s][iq] >= 0:
-                            scores[iq][s] = math.sqrt((x[iq][iq] + x[s][s])**2 + (x[iq][s] - x[s][iq])**2) - x[iq][iq] - x[s][s]
-                        else:
-                            scores[iq][s] = math.sqrt((x[iq][iq] - x[s][s])**2 + (x[iq][s] + x[s][iq])**2) - x[iq][iq] - x[s][s]
+                        t = np.array([
+                                        [x[iq][iq], x[iq][s]],
+                                        [x[s][iq], x[s][s]]
+                                    ])
+                        _, sig, _ = np.linalg.svd(t)
+                        scores[iq][s] = sig[0] - x[iq][iq]
+                        # if x[iq][iq] * x[s][s] - x[iq][s] *x[s][iq] >= 0:
+                        #     scores[iq][s] = math.sqrt((x[iq][iq] + x[s][s])**2 + (x[iq][s] - x[s][iq])**2) - x[iq][iq] - x[s][s]
+                        # else:
+                        #     scores[iq][s] = math.sqrt((x[iq][iq] - x[s][s])**2 + (x[iq][s] + x[s][iq])**2) - x[iq][iq] - x[s][s]
 
 
                     if jq < self.p:
@@ -165,26 +165,26 @@ class ApproxSVD():
                                 xsjq = x[s][jq]
                                 xss = x[s][s]
 
-                            # t = np.array([
-                            #                 [x[jq][jq], x[jq][s]],
-                            #                 [xsjq, xss]
-                            #             ])
-                            # _, sig, _ = np.linalg.svd(t)
-                            # scores[jq][s] = sig[0] - x[jq][jq]
-                            if x[jq][jq] * xss - x[jq][s] *xsjq >= 0:
-                                scores[jq][s] = math.sqrt((x[jq][jq] + xss)**2 + (x[jq][s] - xsjq)**2) - x[jq][jq] - xss
-                            else:
-                                scores[jq][s] = math.sqrt((x[jq][jq] - xss)**2 + (x[jq][s] + xsjq)**2) - x[jq][jq] - xss
+                            t = np.array([
+                                            [x[jq][jq], x[jq][s]],
+                                            [xsjq, xss]
+                                        ])
+                            _, sig, _ = np.linalg.svd(t)
+                            scores[jq][s] = sig[0] - x[jq][jq]
+                            # if x[jq][jq] * xss - x[jq][s] *xsjq >= 0:
+                            #     scores[jq][s] = math.sqrt((x[jq][jq] + xss)**2 + (x[jq][s] - xsjq)**2) - x[jq][jq] - xss
+                            # else:
+                            #     scores[jq][s] = math.sqrt((x[jq][jq] - xss)**2 + (x[jq][s] + xsjq)**2) - x[jq][jq] - xss
                         
                     for r in range(iq):
-                        # t = np.array([[x[r][r], x[r][iq]],
-                        #             [x[iq][r], x[iq][iq]]])
-                        # _, sig, _ = np.linalg.svd(t)
-                        # scores[r][iq] = sig[0] - x[r][r]
-                        if x[r][iq] * x[iq][iq] - x[r][iq] *x[iq][r] >= 0:
-                            scores[r][iq] = math.sqrt((x[r][r] + x[iq][iq])**2 + (x[r][iq] - x[iq][r])**2) - x[r][r] - x[iq][iq]
-                        else:
-                            scores[r][iq] = math.sqrt((x[r][r] - x[iq][iq])**2 + (x[r][iq] + x[iq][r])**2) - x[r][r] - x[iq][iq]
+                        t = np.array([[x[r][r], x[r][iq]],
+                                    [x[iq][r], x[iq][iq]]])
+                        _, sig, _ = np.linalg.svd(t)
+                        scores[r][iq] = sig[0] - x[r][r]
+                        # if x[r][iq] * x[iq][iq] - x[r][iq] *x[iq][r] >= 0:
+                        #     scores[r][iq] = math.sqrt((x[r][r] + x[iq][iq])**2 + (x[r][iq] - x[iq][r])**2) - x[r][r] - x[iq][iq]
+                        # else:
+                        #     scores[r][iq] = math.sqrt((x[r][r] - x[iq][iq])**2 + (x[r][iq] + x[iq][r])**2) - x[r][r] - x[iq][iq]
                     
                     for r in range(min(jq, self.p)):
                         if jq >= d:
@@ -194,17 +194,17 @@ class ApproxSVD():
                             x_jq_r = x[jq][r]
                             x_jq_jq = x[jq][jq]
 
-                        # t = np.array([
-                        #                 [x[r][r], x[r][jq]],
-                        #                 [x_jq_r, x_jq_jq]
-                        #             ])
-                        # _, sig, _ = np.linalg.svd(t)
+                        t = np.array([
+                                        [x[r][r], x[r][jq]],
+                                        [x_jq_r, x_jq_jq]
+                                    ])
+                        _, sig, _ = np.linalg.svd(t)
 
-                        # scores[r][jq] = sig[0] - x[r][r]
-                        if x[r][jq] * x_jq_jq - x[r][jq] * x_jq_r >= 0:
-                            scores[r][jq] = math.sqrt((x[r][r] + x_jq_jq)**2 + (x[r][jq] - x_jq_r)**2) - x[r][r] - x_jq_jq
-                        else:
-                            scores[r][jq] = math.sqrt((x[r][r] - x_jq_jq)**2 + (x[r][jq] + x_jq_r)**2) - x[r][r] - x_jq_jq
+                        scores[r][jq] = sig[0] - x[r][r]
+                        # if x[r][jq] * x_jq_jq - x[r][jq] * x_jq_r >= 0:
+                        #     scores[r][jq] = math.sqrt((x[r][r] + x_jq_jq)**2 + (x[r][jq] - x_jq_r)**2) - x[r][r] - x_jq_jq
+                        # else:
+                        #     scores[r][jq] = math.sqrt((x[r][r] - x_jq_jq)**2 + (x[r][jq] + x_jq_r)**2) - x[r][r] - x_jq_jq
                     
                 traces = np.append(traces,  np.trace(x[:self.p, :self.p]))
         
