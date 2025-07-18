@@ -10,6 +10,7 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 from multiprocessing import shared_memory
 import multiprocessing as mp
+from heap import TwoLevelHeap
  
 np.set_printoptions(suppress=True, precision = 4, linewidth = 200)
  
@@ -34,12 +35,13 @@ class catchtime:
  
 class ApproxSVD():
  
-    def __init__(self, n_iter, p, score_method = 'cf', debug_mode = False, jobs = -1, stored_g = False, use_shared_memory = True):
+    def __init__(self, n_iter, p, score_method = 'cf', debug_mode = False, jobs = -1, stored_g = False, use_shared_memory = True, use_heap = False):
         self.n_iter = n_iter
         self.p = p
         self.debug_mode = debug_mode
         self.jobs = jobs
         self.use_shared_memory = use_shared_memory
+        self.use_heap = use_heap
         self.logger = logging.getLogger(self.__class__.__name__)
         self.stored_g = stored_g
         if self.stored_g:
@@ -273,11 +275,18 @@ class ApproxSVD():
                     )
                     for i, j, value in results:
                         scores[i][j] = value
+
+            if self.use_heap:
+                with catchtime(self.debug_mode, self.logger, "build heap"):
+                    self.heap = TwoLevelHeap(scores)
  
             for q in tqdm(range(self.n_iter)):
                 # get max score from matrix
                 #with catchtime(self.debug_mode, self.logger, "find max score"):
-                iq, jq = np.unravel_index(np.argmax(scores), scores.shape)
+                if self.use_heap:
+                    _, iq, jq = self.heap.get_max()
+                else:
+                    iq, jq = np.unravel_index(np.argmax(scores), scores.shape)
  
                 if jq >= d:
                     xji = 0
@@ -305,18 +314,31 @@ class ApproxSVD():
                 #with catchtime(self.debug_mode, self.logger, "update scores"):
                 # update scores
                 for s in range(iq + 1, d):
-                    scores[iq][s] = self.score_fn(iq, s, x, d)[2]
- 
+                    if self.use_heap:
+                        self.heap.update(iq, s, self.score_fn(iq, s, x, d)[2])
+                    else:
+                        scores[iq][s] = self.score_fn(iq, s, x, d)[2]
+
+
                 if jq < self.p:
                     for s in range(jq + 1, n):
-                        scores[jq][s] = self.score_fn(jq, s, x, d)[2]
- 
+                        if self.use_heap:
+                            self.heap.update(jq, s, self.score_fn(jq, s, x, d)[2])
+                        else:
+                            scores[jq][s] = self.score_fn(jq, s, x, d)[2]
+
                 for r in range(iq):
-                    scores[r][iq] = self.score_fn(r, iq, x, d)[2]
- 
+                    if self.use_heap:
+                        self.heap.update(r, iq, self.score_fn(r, iq, x, d)[2])
+                    else:
+                        scores[r][iq] = self.score_fn(r, iq, x, d)[2]
+
                 for r in range(min(jq, self.p)):
-                    scores[r][jq] = self.score_fn(r, jq, x, d)[2]
- 
+                    if self.use_heap:
+                        self.heap.update(r, jq, self.score_fn(r, jq, x, d)[2])
+                    else: 
+                        scores[r][jq] = self.score_fn(r, jq, x, d)[2]
+
                 traces = np.append(traces,  np.trace(x[:self.p, :self.p]))
             if self.stored_g == True:
                 self.build_ubar(u)
