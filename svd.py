@@ -5,7 +5,9 @@ from scipy.sparse.linalg import svds
 import logging
 import time
 from time import perf_counter
-import math
+from numba import njit
+import numpy as np
+from math import sqrt
 from joblib import Parallel, delayed
 from tqdm import tqdm
 from multiprocessing import shared_memory
@@ -140,25 +142,27 @@ class ApproxSVD():
         c1 = (np.linalg.norm(t, 'fro') ** 2)/2
         c1_squared = c1 ** 2
         c2_squared = np.linalg.det(t) ** 2
-        value = math.sqrt(c1 + math.sqrt(c1_squared - c2_squared)) - t[0][0]
+        # due to rounding, use abs below issues
+        value = sqrt(c1 + sqrt(abs(c1_squared - c2_squared))) - t[0][0]
  
         return (i, j, value)
  
     # score using closed form of svd
     def compute_score_cf(self, i, j, x, d):
-        if j >= d:
-            xji = 0
-            xjj = 0
+        xji = x[j, i] if j < d else 0.0
+        xjj = x[j, j] if j < d else 0.0
+
+        xii = x[i, i]
+        xij = x[i, j]
+
+        if xii * xjj - xij * xji >= 0:
+            diff = xij - xji
+            val = np.sqrt((xii + xjj)**2 + diff**2) - xii - xjj
         else:
-            xji = x[j][i]
-            xjj = x[j][j]
- 
-        if x[i][i] * xjj - x[i][j] * xji >= 0:
-            value = math.sqrt((x[i][i] + xjj)**2 + (x[i][j] - xji)**2) - x[i][i] - xjj
-        else:
-            value = math.sqrt((x[i][i] - xjj)**2 + (x[i][j] + xji)**2) - x[i][i] - xjj
- 
-        return (i, j, value)
+            diff = xij + xji
+            val = np.sqrt((xii - xjj)**2 + diff**2) - xii - xjj
+
+        return i, j, val
  
     # score using explicit svd
     def compute_score_svd(self, i, j, x , d):
@@ -202,19 +206,25 @@ class ApproxSVD():
  
     @staticmethod
     def _compute_score_cf_static(i, j, x, d):
-        if j >= d:
-            xji = 0
-            xjj = 0
+        # Conditional logic for xji, xjj
+        if j < d:
+            xji = x[j, i]
+            xjj = x[j, j]
         else:
-            xji = x[j][i]
-            xjj = x[j][j]
- 
-        if x[i][i] * xjj - x[i][j] * xji >= 0:
-            value = math.sqrt((x[i][i] + xjj)**2 + (x[i][j] - xji)**2) - x[i][i] - xjj
+            xji = 0.0
+            xjj = 0.0
+
+        xii = x[i, i]
+        xij = x[i, j]
+
+        if xii * xjj - xij * xji >= 0:
+            diff = xij - xji
+            value = np.sqrt((xii + xjj)**2 + diff**2) - xii - xjj
         else:
-            value = math.sqrt((x[i][i] - xjj)**2 + (x[i][j] + xji)**2) - x[i][i] - xjj
- 
-        return (i, j, value)
+            diff = xij + xji
+            value = np.sqrt((xii - xjj)**2 + diff**2) - xii - xjj
+
+        return i, j, value
  
     @staticmethod
     def _compute_score_fro_static(i, j, x, d):
@@ -233,7 +243,7 @@ class ApproxSVD():
         c1 = (np.linalg.norm(t, 'fro') ** 2)/2
         c1_squared = c1 ** 2
         c2_squared = np.linalg.det(t) ** 2
-        value = math.sqrt(c1 + math.sqrt(c1_squared - c2_squared)) - t[0][0]
+        value = sqrt(c1 + sqrt(c1_squared - c2_squared)) - t[0][0]
  
         return (i, j, value)
  
@@ -258,7 +268,7 @@ class ApproxSVD():
         d = trueX.shape[0]
         n = trueX.shape[1]
         u = np.identity(d)
-        x = copy.deepcopy(trueX)
+        x = np.array(trueX, copy=True)
  
         traces = np.array([])
         scores = np.zeros((self.p, n))
@@ -319,7 +329,9 @@ class ApproxSVD():
                     else:
                         scores[iq][s] = self.score_fn(iq, s, x, d)[2]
 
-
+                ###
+                ### maybe rebuild heap for row?
+                ###
                 if jq < self.p:
                     for s in range(jq + 1, n):
                         if self.use_heap:
@@ -378,3 +390,28 @@ class ApproxSVD():
         reducedX = u[:self.p, :] @ trueX
 
         return traces, reducedX, x
+    
+    def fit_batched(self, trueX, batch_size = 300):
+        d = trueX.shape[0]
+        n = trueX.shape[1]
+        if batch_size < d:
+            self.logger.info("Batch size too small! Setting to %d", d)
+            batch_size = d
+        start_index = 0
+        end_index = min(batch_size, n)
+        x_batch = trueX[:, start_index:end_index+1]
+        traces = []
+        sub_traces, u, x = self.fit(x_batch)
+        while True:
+            traces.extend(sub_traces)
+            if end_index == n:
+                break
+            start_index = start_index + batch_size
+            end_index = min(end_index + batch_size, n)
+            x_batch = np.hstack((
+                x[:, :self.p],                           # Equivalent to X(:, 1:p) in MATLAB (note: MATLAB is 1-based, Python is 0-based)
+                u @ trueX[:, start_index:end_index+1]  # Matrix multiplication, note +1 because Python slicing is exclusive
+            ))
+            sub_traces, u, x = self.fit(x_batch)
+        
+        return traces, u, x
