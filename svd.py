@@ -13,6 +13,7 @@ from tqdm import tqdm
 from multiprocessing import shared_memory
 import multiprocessing as mp
 from heap import TwoLevelHeap
+from numba import njit, prange
  
 np.set_printoptions(suppress=True, precision = 4, linewidth = 200)
  
@@ -34,6 +35,45 @@ class catchtime:
         self.time = perf_counter() - self.start
         self.readout = f'Time: {self.time:.3f} seconds for {self.label}'
         self.log.debug(self.readout)
+
+@njit(parallel=True)
+def compute_and_assign_numba_parallel(p, x, scores):
+    d, n = x.shape
+
+    idx = 0
+    for i in prange(p):
+        for j in range(i + 1, n):
+            xji = x[j, i] if j < d else 0.0
+            xjj = x[j, j] if j < d else 0.0
+
+            xii = x[i, i]
+            xij = x[i, j]
+
+            if xii * xjj - xij * xji >= 0:
+                diff = xij - xji
+                val = np.sqrt((xii + xjj)**2 + diff**2) - xii - xjj
+            else:
+                diff = xij + xji
+                val = np.sqrt((xii - xjj)**2 + diff**2) - xii - xjj
+
+            scores[i, j] = val
+
+@njit(parallel=True)
+def compute_score_cf_numba(i, j, x, d):
+    xji = x[j, i] if j < d else 0.0
+    xjj = x[j, j] if j < d else 0.0
+
+    xii = x[i, i]
+    xij = x[i, j]
+
+    if xii * xjj - xij * xji >= 0:
+        diff = xij - xji
+        val = np.sqrt((xii + xjj)**2 + diff**2) - xii - xjj
+    else:
+        diff = xij + xji
+        val = np.sqrt((xii - xjj)**2 + diff**2) - xii - xjj
+
+    return i, j, val
  
 class ApproxSVD():
  
@@ -63,7 +103,7 @@ class ApproxSVD():
             case "fro":
                 self.score_fn = self.compute_score_fro
             case "cf":
-                self.score_fn = self.compute_score_cf
+                self.score_fn = compute_score_cf_numba
             case "svd":
                 self.score_fn = self.compute_score_svd
             case _:
@@ -126,6 +166,7 @@ class ApproxSVD():
         x[j, :] = m[0][1] * row_i + m[1][1] * row_j
  
     # score using frobenius norm
+    @njit(parallel=True)
     def compute_score_fro(self, i, j, x, d):
         if j >= d:
             xji = 0
@@ -148,6 +189,7 @@ class ApproxSVD():
         return (i, j, value)
  
     # score using closed form of svd
+    @njit(parallel=True)
     def compute_score_cf(self, i, j, x, d):
         xji = x[j, i] if j < d else 0.0
         xjj = x[j, j] if j < d else 0.0
@@ -163,7 +205,50 @@ class ApproxSVD():
             val = np.sqrt((xii - xjj)**2 + diff**2) - xii - xjj
 
         return i, j, val
- 
+    
+    def compute_and_assign_triangular_safe(self, p, x, scores):
+        """
+        Vectorized computation and assignment for:
+            for i in range(p):
+                for j in range(i+1, n):
+                    scores[i][j] = compute_score_cf(i, j, x, d)
+        where:
+            d = number of rows in x (dimensions)
+            n = number of columns in x (observations)
+        """
+        d, n = x.shape  # rows = dimensions, cols = observations
+
+        # Generate all i,j pairs for i < j, i < p
+        i_arr = np.repeat(np.arange(p), n - np.arange(1, p + 1))
+        j_arr = np.concatenate([np.arange(i + 1, n) for i in range(p)])
+
+        # Allocate xji, xjj with zeros
+        xji = np.zeros(len(i_arr), dtype=float)
+        xjj = np.zeros(len(i_arr), dtype=float)
+
+        # Mask for j < d (safe indexing)
+        mask_jd = j_arr < d
+        xji[mask_jd] = x[j_arr[mask_jd], i_arr[mask_jd]]
+        xjj[mask_jd] = x[j_arr[mask_jd], j_arr[mask_jd]]
+
+        # Other values from x (safe because i < d always holds — p ≤ d)
+        xii = x[i_arr, i_arr]
+        xij = x[i_arr, j_arr]
+
+        # Condition and computation
+        cond = (xii * xjj - xij * xji) >= 0
+
+        diff1 = xij - xji
+        diff2 = xij + xji
+
+        val_if   = np.sqrt((xii + xjj)**2 + diff1**2) - xii - xjj
+        val_else = np.sqrt((xii - xjj)**2 + diff2**2) - xii - xjj
+
+        vals = np.where(cond, val_if, val_else)
+
+        # Assign directly to scores
+        scores[i_arr, j_arr] = vals
+    
     # score using explicit svd
     def compute_score_svd(self, i, j, x , d):
         if j >= d:
@@ -275,16 +360,19 @@ class ApproxSVD():
         with catchtime(self.debug_mode, self.logger, "total time"):
  
             with catchtime(self.debug_mode, self.logger, "initial scores"):
-                if self.use_shared_memory and self.jobs != 1:
-                    self._compute_initial_scores_shared(x, d, scores)
-                else:
-                    results = Parallel(n_jobs=self.jobs, prefer="processes")(
-                        delayed(self.score_fn)(i, j, x, d)
-                        for i in range(self.p)
-                        for j in range(i + 1, n)
-                    )
-                    for i, j, value in results:
-                        scores[i][j] = value
+                # if self.use_shared_memory and self.jobs != 1:
+                #     self._compute_initial_scores_shared(x, d, scores)
+                # else:
+                #     results = Parallel(n_jobs=self.jobs, prefer="processes")(
+                #         delayed(self.score_fn)(i, j, x, d)
+                #         for i in range(self.p)
+                #         for j in range(i + 1, n)
+                #     )
+                #     for i, j, value in results:
+                #         scores[i][j] = value
+                #self.compute_and_assign_triangular_safe(self.p, x, scores)
+                compute_and_assign_numba_parallel(self.p, x, scores)
+                
 
             if self.use_heap:
                 with catchtime(self.debug_mode, self.logger, "build heap"):
@@ -409,7 +497,7 @@ class ApproxSVD():
             start_index = start_index + batch_size
             end_index = min(end_index + batch_size, n)
             x_batch = np.hstack((
-                x[:, :self.p],                           # Equivalent to X(:, 1:p) in MATLAB (note: MATLAB is 1-based, Python is 0-based)
+                x[:, :self.p],                          
                 u @ trueX[:, start_index:end_index+1]  # Matrix multiplication, note +1 because Python slicing is exclusive
             ))
             sub_traces, u, x = self.fit(x_batch)
