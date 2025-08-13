@@ -14,8 +14,11 @@ from multiprocessing import shared_memory
 import multiprocessing as mp
 from heap import TwoLevelHeap
 from numba import njit, prange
+from simple_heap import MatrixMaxHeap
  
 np.set_printoptions(suppress=True, precision = 4, linewidth = 200)
+
+
  
 class catchtime:
     def __init__(self, debug_mode, log, label = ""):
@@ -206,49 +209,6 @@ class ApproxSVD():
 
         return i, j, val
     
-    def compute_and_assign_triangular_safe(self, p, x, scores):
-        """
-        Vectorized computation and assignment for:
-            for i in range(p):
-                for j in range(i+1, n):
-                    scores[i][j] = compute_score_cf(i, j, x, d)
-        where:
-            d = number of rows in x (dimensions)
-            n = number of columns in x (observations)
-        """
-        d, n = x.shape  # rows = dimensions, cols = observations
-
-        # Generate all i,j pairs for i < j, i < p
-        i_arr = np.repeat(np.arange(p), n - np.arange(1, p + 1))
-        j_arr = np.concatenate([np.arange(i + 1, n) for i in range(p)])
-
-        # Allocate xji, xjj with zeros
-        xji = np.zeros(len(i_arr), dtype=float)
-        xjj = np.zeros(len(i_arr), dtype=float)
-
-        # Mask for j < d (safe indexing)
-        mask_jd = j_arr < d
-        xji[mask_jd] = x[j_arr[mask_jd], i_arr[mask_jd]]
-        xjj[mask_jd] = x[j_arr[mask_jd], j_arr[mask_jd]]
-
-        # Other values from x (safe because i < d always holds — p ≤ d)
-        xii = x[i_arr, i_arr]
-        xij = x[i_arr, j_arr]
-
-        # Condition and computation
-        cond = (xii * xjj - xij * xji) >= 0
-
-        diff1 = xij - xji
-        diff2 = xij + xji
-
-        val_if   = np.sqrt((xii + xjj)**2 + diff1**2) - xii - xjj
-        val_else = np.sqrt((xii - xjj)**2 + diff2**2) - xii - xjj
-
-        vals = np.where(cond, val_if, val_else)
-
-        # Assign directly to scores
-        scores[i_arr, j_arr] = vals
-    
     # score using explicit svd
     def compute_score_svd(self, i, j, x , d):
         if j >= d:
@@ -376,7 +336,7 @@ class ApproxSVD():
 
             if self.use_heap:
                 with catchtime(self.debug_mode, self.logger, "build heap"):
-                    self.heap = TwoLevelHeap(scores)
+                    self.heap = MatrixMaxHeap(scores)
  
             for q in tqdm(range(self.n_iter)):
                 # get max score from matrix
