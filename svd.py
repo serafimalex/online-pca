@@ -309,10 +309,11 @@ class ApproxSVD():
         return (i, j, value)
  
  
-    def fit(self, trueX):
+    def fit(self, trueX, u = None):
         d = trueX.shape[0]
         n = trueX.shape[1]
-        u = np.identity(d)
+        if u is None:
+            u = np.identity(d)
         x = np.array(trueX, copy=True)
  
         traces = np.array([])
@@ -460,6 +461,6 @@ class ApproxSVD():
                 x[:, :self.p],                          
                 u @ trueX[:, start_index:end_index+1]  # Matrix multiplication, note +1 because Python slicing is exclusive
             ))
-            sub_traces, u, x = self.fit(x_batch)
+            sub_traces, u, x = self.fit(x_batch, u)
         
         return traces, u, x
