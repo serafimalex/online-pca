@@ -9,38 +9,69 @@ from numba import njit
 import numpy as np
 from math import sqrt
 from joblib import Parallel, delayed
+from collections import defaultdict
 from tqdm import tqdm
 from multiprocessing import shared_memory
 import multiprocessing as mp
 from heap import TwoLevelHeap
 from numba import njit, prange
 from simple_heap import MatrixMaxHeap
+from numba_heap import MatrixHeap
  
 np.set_printoptions(suppress=True, precision = 4, linewidth = 200)
 
 
  
 class catchtime:
-    def __init__(self, debug_mode, log, label = ""):
+    _totals = defaultdict(lambda: {"time": 0.0, "count": 0})  # stores per-label stats
+    
+    def __init__(self, debug_mode, log, label=""):
         self.label = label
         self.debug_mode = debug_mode
         self.log = log
  
     def __enter__(self):
-        if self.debug_mode == False:
+        if not self.debug_mode:
             return
         self.start = perf_counter()
         return self
  
     def __exit__(self, type, value, traceback):
-        if self.debug_mode == False:
+        if not self.debug_mode:
             return
-        self.time = perf_counter() - self.start
-        self.readout = f'Time: {self.time:.3f} seconds for {self.label}'
-        self.log.debug(self.readout)
+        elapsed = perf_counter() - self.start
+        self.readout = f'Time: {elapsed:.3f} seconds for {self.label}'
+        #self.log.debug(self.readout)
+
+        # accumulate total + count for this label
+        catchtime._totals[self.label]["time"] += elapsed
+        catchtime._totals[self.label]["count"] += 1
+
+    @classmethod
+    def get_stats(cls, label=None):
+        """Get stats for a label or all labels.
+        Returns dict with total time, count, and average time.
+        """
+        if label is not None:
+            stats = cls._totals.get(label, {"time": 0.0, "count": 0})
+            avg = stats["time"] / stats["count"] if stats["count"] else 0.0
+            return {"total": stats["time"], "count": stats["count"], "avg": avg}
+        result = {}
+        for lbl, stats in cls._totals.items():
+            avg = stats["time"] / stats["count"] if stats["count"] else 0.0
+            result[lbl] = {"total": stats["time"], "count": stats["count"], "avg": avg}
+        return result
+
+    @classmethod
+    def reset(cls, label=None):
+        """Reset stats for a label or all labels."""
+        if label is not None:
+            cls._totals.pop(label, None)
+        else:
+            cls._totals.clear()
 
 @njit(parallel=True)
-def compute_and_assign_numba_parallel(p, x, scores):
+def compute_and_assign_numba_cf(p, x, scores):
     d, n = x.shape
 
     idx = 0
@@ -59,7 +90,7 @@ def compute_and_assign_numba_parallel(p, x, scores):
                 diff = xij + xji
                 val = np.sqrt((xii - xjj)**2 + diff**2) - xii - xjj
 
-            scores[i, j] = val
+            scores[i, j] = np.float64(val)
 
 @njit(parallel=True)
 def compute_score_cf_numba(i, j, x, d):
@@ -76,8 +107,168 @@ def compute_score_cf_numba(i, j, x, d):
         diff = xij + xji
         val = np.sqrt((xii - xjj)**2 + diff**2) - xii - xjj
 
-    return i, j, val
+    return i, j, np.float64(val)
+
+@njit(parallel=True)
+def compute_and_assign_numba_fro(p, x, scores):
+    d, n = x.shape
+
+    for i in prange(p):
+        for j in range(i + 1, n):
+            if j >= d:
+                xji = 0.0
+                xjj = 0.0
+            else:
+                xji = x[j, i]
+                xjj = x[j, j]
+
+            xii = x[i, i]
+            xij = x[i, j]
+
+            # Frobenius-based formula
+            c1 = (xii * xii + xij * xij + xji * xji + xjj * xjj) / 2.0
+            c1_squared = c1 * c1
+            det_t = xii * xjj - xij * xji
+            c2_squared = det_t * det_t
+
+            value = np.sqrt(c1 + np.sqrt(abs(c1_squared - c2_squared))) - xii
+
+            scores[i, j] = np.float64(value)
+
+
+@njit(fastmath=True)
+def compute_score_fro_numba(i, j, x, d):
+    if j >= d:
+        xji = 0.0
+        xjj = 0.0
+    else:
+        xji = x[j, i]
+        xjj = x[j, j]
+
+    xii = x[i, i]
+    xij = x[i, j]
+
+    # Precompute squares once
+    xii2 = xii * xii
+    xij2 = xij * xij
+    xji2 = xji * xji
+    xjj2 = xjj * xjj
+
+    # Frobenius norm squared / 2
+    c1 = (xii2 + xij2 + xji2 + xjj2) * 0.5
+    c1_squared = c1 * c1
+
+    # Determinant squared
+    det_t = xii * xjj - xij * xji
+    c2_squared = det_t * det_t
+
+    # Guard against negatives (branchless)
+    inner = c1_squared - c2_squared
+    if inner < 0.0:
+        inner = 0.0
+
+    value = sqrt(c1 + sqrt(inner)) - xii
+    return i, j, value
+
+@njit(parallel=True)
+def rightMatmul_numba(x, i, j, m):
+    n_rows, n_cols = x.shape
+
+    # Temporary copies of the columns
+    if i < n_cols:
+        col_i = np.empty(n_rows, dtype=x.dtype)
+        for r in prange(n_rows):
+            col_i[r] = x[r, i]
+    else:
+        col_i = np.zeros(n_rows, dtype=x.dtype)
+
+    if j < n_cols:
+        col_j = np.empty(n_rows, dtype=x.dtype)
+        for r in prange(n_rows):
+            col_j[r] = x[r, j]
+    else:
+        col_j = np.zeros(n_rows, dtype=x.dtype)
+
+    # Apply 2x2 matrix multiplication
+    if i < n_cols:
+        for r in prange(n_rows):
+            x[r, i] = m[0, 0] * col_i[r] + m[1, 0] * col_j[r]
+
+    if j < n_cols:
+        for r in prange(n_rows):
+            x[r, j] = m[0, 1] * col_i[r] + m[1, 1] * col_j[r]
+
+@njit(parallel=True, fastmath=True)
+def leftMatmul_numba(x, i, j, m):
+    n_cols = x.shape[1]
+
+    # copy rows safely
+    row_i = np.empty(n_cols, dtype=x.dtype)
+    row_j = np.empty(n_cols, dtype=x.dtype)
+
+    for c in prange(n_cols):
+        row_i[c] = x[i, c]
+        row_j[c] = x[j, c]
+
+    for c in prange(n_cols):
+        x[i, c] = m[0, 0] * row_i[c] + m[0, 1] * row_j[c]
+        x[j, c] = m[1, 0] * row_i[c] + m[1, 1] * row_j[c]
+
+
+@njit(parallel=True, fastmath=True)
+def leftMatmulTranspose_numba(x, i, j, m):
+    n_cols = x.shape[1]
+
+    row_i = np.empty(n_cols, dtype=x.dtype)
+    row_j = np.empty(n_cols, dtype=x.dtype)
+
+    for c in prange(n_cols):
+        row_i[c] = x[i, c]
+        row_j[c] = x[j, c]
+
+    for c in prange(n_cols):
+        x[i, c] = m[0, 0] * row_i[c] + m[1, 0] * row_j[c]
+        x[j, c] = m[0, 1] * row_i[c] + m[1, 1] * row_j[c]
+
+
+@njit(parallel=True, fastmath=True)
+def rightMatmulTranspose_numba(x, i, j, m):
+    n_rows, n_cols = x.shape
+
+    if i < n_cols:
+        col_i = np.empty(n_rows, dtype=x.dtype)
+        for r in prange(n_rows):
+            col_i[r] = x[r, i]
+    else:
+        col_i = np.zeros(n_rows, dtype=x.dtype)
+
+    if j < n_cols:
+        col_j = np.empty(n_rows, dtype=x.dtype)
+        for r in prange(n_rows):
+            col_j[r] = x[r, j]
+    else:
+        col_j = np.zeros(n_rows, dtype=x.dtype)
+
+    if i < n_cols:
+        for r in prange(n_rows):
+            x[r, i] = m[0, 0] * col_i[r] + m[0, 1] * col_j[r]
+
+    if j < n_cols:
+        for r in prange(n_rows):
+            x[r, j] = m[1, 0] * col_i[r] + m[1, 1] * col_j[r]
  
+@njit()
+def get_new_vals_numba(new_vals, iq, x, d):
+    for s in range(iq + 1, d):
+        new_vals[s] = compute_score_cf_numba(iq, s, x, d)[2]
+    return new_vals
+
+@njit()
+def get_new_vals_numba2(new_vals, jq, x, d, n):
+    for s in range(jq + 1, n):
+        new_vals[s] = compute_score_cf_numba(jq, s, x, d)[2]
+    return new_vals
+
 class ApproxSVD():
  
     def __init__(self, n_iter, p, score_method = 'cf', debug_mode = False, jobs = -1, stored_g = False, use_shared_memory = True, use_heap = False):
@@ -104,9 +295,11 @@ class ApproxSVD():
  
         match score_method:
             case "fro":
-                self.score_fn = self.compute_score_fro
+                self.score_fn = compute_score_fro_numba
+                self.assign_fn = compute_and_assign_numba_fro
             case "cf":
                 self.score_fn = compute_score_cf_numba
+                self.assign_fn = compute_and_assign_numba_cf
             case "svd":
                 self.score_fn = self.compute_score_svd
             case _:
@@ -169,7 +362,6 @@ class ApproxSVD():
         x[j, :] = m[0][1] * row_i + m[1][1] * row_j
  
     # score using frobenius norm
-    @njit(parallel=True)
     def compute_score_fro(self, i, j, x, d):
         if j >= d:
             xji = 0
@@ -192,7 +384,6 @@ class ApproxSVD():
         return (i, j, value)
  
     # score using closed form of svd
-    @njit(parallel=True)
     def compute_score_cf(self, i, j, x, d):
         xji = x[j, i] if j < d else 0.0
         xjj = x[j, j] if j < d else 0.0
@@ -321,28 +512,20 @@ class ApproxSVD():
         with catchtime(self.debug_mode, self.logger, "total time"):
  
             with catchtime(self.debug_mode, self.logger, "initial scores"):
-                # if self.use_shared_memory and self.jobs != 1:
-                #     self._compute_initial_scores_shared(x, d, scores)
-                # else:
-                #     results = Parallel(n_jobs=self.jobs, prefer="processes")(
-                #         delayed(self.score_fn)(i, j, x, d)
-                #         for i in range(self.p)
-                #         for j in range(i + 1, n)
-                #     )
-                #     for i, j, value in results:
-                #         scores[i][j] = value
-                #self.compute_and_assign_triangular_safe(self.p, x, scores)
-                compute_and_assign_numba_parallel(self.p, x, scores)
+                self.assign_fn(self.p, x, scores)
                 
 
-            if self.use_heap:
+            if self.use_heap == "optimized_heap":
+                with catchtime(self.debug_mode, self.logger, "build heap"):
+                    self.heap = MatrixHeap(scores)
+            elif self.use_heap == "basic_heap":
                 with catchtime(self.debug_mode, self.logger, "build heap"):
                     self.heap = MatrixMaxHeap(scores)
  
             for q in tqdm(range(self.n_iter)):
                 # get max score from matrix
                 #with catchtime(self.debug_mode, self.logger, "find max score"):
-                if self.use_heap:
+                if self.use_heap == "optimized_heap" or self.use_heap == "basic_heap":
                     _, iq, jq = self.heap.get_max()
                 else:
                     iq, jq = np.unravel_index(np.argmax(scores), scores.shape)
@@ -353,56 +536,84 @@ class ApproxSVD():
                 else:
                     xji = x[jq][iq]
                     xjj = x[jq][jq]
-                #with catchtime(self.debug_mode, self.logger, "perform matrix mul"):
-                t = np.array([
-                                [x[iq][iq], x[iq][jq]], 
-                                [xji,       xjj]
-                            ])
-                G, _, H = np.linalg.svd(t)
+                with catchtime(self.debug_mode, self.logger, "perform small svd"):
+                    t = np.array([
+                                    [x[iq][iq], x[iq][jq]], 
+                                    [xji,       xjj]
+                                ])
+                    G, _, H = np.linalg.svd(t)
  
                 # update intermediate x and u
-                self.rightMatmulTranspose(x, iq, jq, H) # equivalent to x @ H.transpose()
-                if self.stored_g == False:
-                    self.rightMatmul(u, iq, jq, G) # equivalent to u @ G
-                else:
-                    self.g_transforms.append((G, iq, jq))
- 
-                if jq < d:
-                    self.leftMatmulTranspose(x, iq, jq, G) # equivalent to G.transpose() @ x
+                with catchtime(self.debug_mode, self.logger, "perform matrix mul"):
+                    rightMatmulTranspose_numba(x, iq, jq, H) # equivalent to x @ H.transpose()
+                    if self.stored_g == False:
+                        rightMatmul_numba(u, iq, jq, G) # equivalent to u @ G
+                    else:
+                        self.g_transforms.append((G, iq, jq))
+    
+                    if jq < d:
+                        leftMatmulTranspose_numba(x, iq, jq, G) # equivalent to G.transpose() @ x
  
                 #with catchtime(self.debug_mode, self.logger, "update scores"):
                 # update scores
-                for s in range(iq + 1, d):
-                    if self.use_heap:
+                # Assuming self.use_heap determines whether to use MatrixHeap or plain scores array
+
+                if self.use_heap == "optimized_heap":
+                    with catchtime(self.debug_mode, self.logger, "calculate row score"):
+                        # Update row iq for all columns from iq+1 to d-1
+                        new_values_iq = get_new_vals_numba(self.heap.get_row(iq), iq, x, d)
+                        # self.heap.get_row(iq)  # convert back from negative
+                        # for s in range(iq + 1, d):
+                        #     new_values_iq[s] = self.score_fn(iq, s, x, d)[2]
+                    with catchtime(self.debug_mode, self.logger, "rebuild heap"):
+                        self.heap.update_row(iq, new_values_iq)
+
+                        if jq < self.p:
+                            # new_values_jq = self.heap.get_row(jq)
+                            # for s in range(jq + 1, n):
+                            #     new_values_jq[s] = self.score_fn(jq, s, x, d)[2]
+                            with catchtime(self.debug_mode, self.logger, "calculate row score"):
+                                new_values_jq = get_new_vals_numba2(self.heap.get_row(jq), jq, x, d, n)
+                            with catchtime(self.debug_mode, self.logger, "rebuild heap"):
+                                self.heap.update_row(jq, new_values_jq)
+
+                    with catchtime(self.debug_mode, self.logger, "update cols"):
+                        for r in range(iq):
+                            self.heap.update_cell_wrapper(r, iq, self.score_fn(r, iq, x, d)[2])
+
+
+                        for r in range(min(jq, self.p)):
+                            self.heap.update_cell_wrapper(r, jq, self.score_fn(r, jq, x, d)[2])
+                elif self.use_heap == "basic_heap":
+                    for s in range(iq + 1, d):
                         self.heap.update(iq, s, self.score_fn(iq, s, x, d)[2])
-                    else:
-                        scores[iq][s] = self.score_fn(iq, s, x, d)[2]
 
-                ###
-                ### maybe rebuild heap for row?
-                ###
-                if jq < self.p:
-                    for s in range(jq + 1, n):
-                        if self.use_heap:
+                    if jq < self.p:
+                        for s in range(jq + 1, n):
                             self.heap.update(jq, s, self.score_fn(jq, s, x, d)[2])
-                        else:
-                            scores[jq][s] = self.score_fn(jq, s, x, d)[2]
 
-                for r in range(iq):
-                    if self.use_heap:
+                    for r in range(iq):
                         self.heap.update(r, iq, self.score_fn(r, iq, x, d)[2])
-                    else:
-                        scores[r][iq] = self.score_fn(r, iq, x, d)[2]
 
-                for r in range(min(jq, self.p)):
-                    if self.use_heap:
+                    for r in range(min(jq, self.p)):
                         self.heap.update(r, jq, self.score_fn(r, jq, x, d)[2])
-                    else: 
+                
+                else:
+                    for s in range(iq + 1, d):
+                        scores[iq][s] = self.score_fn(iq, s, x, d)[2]
+                    if jq < self.p:
+                        for s in range(jq + 1, n):
+                            scores[jq][s] = self.score_fn(jq, s, x, d)[2]
+                    for r in range(iq):
+                        scores[r][iq] = self.score_fn(r, iq, x, d)[2]
+                    for r in range(min(jq, self.p)):
                         scores[r][jq] = self.score_fn(r, jq, x, d)[2]
 
                 traces = np.append(traces,  np.trace(x[:self.p, :self.p]))
             if self.stored_g == True:
                 self.build_ubar(u)
+        print(catchtime.get_stats())
+        catchtime.reset()
         return traces, u, x
  
     def _compute_initial_scores_shared(self, x, d, scores):
