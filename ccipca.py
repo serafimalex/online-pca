@@ -9,7 +9,10 @@ from online_psp.online_psp.util import generate_samples, subspace_error
 from online_psp.online_psp.ccipca import CCIPCA
 
 print('Testing CCIPCA...')
-
+def explained_variance_ratio(X, X_recon):
+    error = np.linalg.norm(X - X_recon, 'fro') ** 2
+    total = np.linalg.norm(X, 'fro') ** 2
+    return 1 - error / total
 # ----------
 # Parameters
 # ----------
@@ -27,13 +30,17 @@ sigma2_0 = 1e-8 * np.ones(K)
 Uhat0 = X[:, :K] / np.sqrt((X[:, :K] ** 2).sum(0))
 
 errs = []
-ccipca = CCIPCA(K, D, Uhat0=Uhat0, sigma2_0=sigma2_0, cython=False)
-
+ccipca = CCIPCA(K, D, Uhat0=Uhat0, sigma2_0=sigma2_0, cython=True)
+print(X.dtype)
 time_1 = time.time()
 for n_e in range(n_epoch):
     for x in X.T:
         ccipca.fit_next(x)
         errs.append(subspace_error(ccipca.get_components(), U[:, :K]))
+        
+X_reduced = ccipca.get_components().T @ X
+X_recon = ccipca.get_components() @ X_reduced
+print(explained_variance_ratio(X,X_recon))
 time_2 = time.time() - time_1
 
 # Plotting...

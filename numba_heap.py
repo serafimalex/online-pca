@@ -24,7 +24,7 @@ def update_matrix_row(matrix, row_idx, new_values):
     
     return matrix
 
-@njit
+@njit(parallel=True)
 def update_matrix_cell(matrix, row_idx, col_idx, new_value):
     """Update a single matrix cell"""
     matrix[row_idx, col_idx] = new_value

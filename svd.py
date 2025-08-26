@@ -257,17 +257,23 @@ def rightMatmulTranspose_numba(x, i, j, m):
         for r in prange(n_rows):
             x[r, j] = m[1, 0] * col_i[r] + m[1, 1] * col_j[r]
  
-@njit()
+@njit(parallel=True)
 def get_new_vals_numba(new_vals, iq, x, d):
     for s in range(iq + 1, d):
         new_vals[s] = compute_score_cf_numba(iq, s, x, d)[2]
     return new_vals
 
-@njit()
+@njit(parallel=True)
 def get_new_vals_numba2(new_vals, jq, x, d, n):
     for s in range(jq + 1, n):
         new_vals[s] = compute_score_cf_numba(jq, s, x, d)[2]
     return new_vals
+
+@njit(parallel=True)
+def get_new_vals_col_numba(r, iq, x, d):
+    new_vals = np.empty()
+    for r in range(iq):
+                            self.heap.update_cell_wrapper(r, iq, self.score_fn(r, iq, x, d)[2])
 
 class ApproxSVD():
  
@@ -568,16 +574,17 @@ class ApproxSVD():
                     with catchtime(self.debug_mode, self.logger, "rebuild heap"):
                         self.heap.update_row(iq, new_values_iq)
 
-                        if jq < self.p:
-                            # new_values_jq = self.heap.get_row(jq)
-                            # for s in range(jq + 1, n):
-                            #     new_values_jq[s] = self.score_fn(jq, s, x, d)[2]
-                            with catchtime(self.debug_mode, self.logger, "calculate row score"):
-                                new_values_jq = get_new_vals_numba2(self.heap.get_row(jq), jq, x, d, n)
-                            with catchtime(self.debug_mode, self.logger, "rebuild heap"):
-                                self.heap.update_row(jq, new_values_jq)
+                    if jq < self.p:
+                        # new_values_jq = self.heap.get_row(jq)
+                        # for s in range(jq + 1, n):
+                        #     new_values_jq[s] = self.score_fn(jq, s, x, d)[2]
+                        with catchtime(self.debug_mode, self.logger, "calculate row score"):
+                            new_values_jq = get_new_vals_numba2(self.heap.get_row(jq), jq, x, d, n)
+                        with catchtime(self.debug_mode, self.logger, "rebuild heap"):
+                            self.heap.update_row(jq, new_values_jq)
 
                     with catchtime(self.debug_mode, self.logger, "update cols"):
+                        #new_values_iq = get_new_vals_numba_col(r, iq, x, d)
                         for r in range(iq):
                             self.heap.update_cell_wrapper(r, iq, self.score_fn(r, iq, x, d)[2])
 
