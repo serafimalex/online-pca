@@ -20,8 +20,16 @@ from numba_heap import MatrixHeap
  
 np.set_printoptions(suppress=True, precision = 4, linewidth = 200)
 
+GLOBAL_ROW1 = None
+GLOBAL_COLUMN1 = None
+GLOBAL_COLUMN_ZEROS1 = None
+GLOBAL_ROW_ZEROS1 = None
 
- 
+GLOBAL_ROW2 = None
+GLOBAL_COLUMN2 = None
+GLOBAL_COLUMN_ZEROS2 = None
+GLOBAL_ROW_ZEROS2 = None
+
 class catchtime:
     _totals = defaultdict(lambda: {"time": 0.0, "count": 0})  # stores per-label stats
     
@@ -171,23 +179,23 @@ def compute_score_fro_numba(i, j, x, d):
     return i, j, value
 
 @njit(parallel=True)
-def rightMatmul_numba(x, i, j, m):
+def rightMatmul_numba(x, i, j, m, GLOBAL_COLUMN1, GLOBAL_COLUMN2, GLOBAL_COLUMN_ZEROS1, GLOBAL_COLUMN_ZEROS2):
     n_rows, n_cols = x.shape
 
     # Temporary copies of the columns
     if i < n_cols:
-        col_i = np.empty(n_rows, dtype=x.dtype)
         for r in prange(n_rows):
-            col_i[r] = x[r, i]
+            GLOBAL_COLUMN1[r] = x[r, i]
+        col_i = GLOBAL_COLUMN1
     else:
-        col_i = np.zeros(n_rows, dtype=x.dtype)
+        col_i = GLOBAL_COLUMN_ZEROS1
 
     if j < n_cols:
-        col_j = np.empty(n_rows, dtype=x.dtype)
         for r in prange(n_rows):
-            col_j[r] = x[r, j]
+            GLOBAL_COLUMN2[r] = x[r, j]
+        col_j = GLOBAL_COLUMN2
     else:
-        col_j = np.zeros(n_rows, dtype=x.dtype)
+        col_j = GLOBAL_COLUMN_ZEROS2
 
     # Apply 2x2 matrix multiplication
     if i < n_cols:
@@ -199,16 +207,15 @@ def rightMatmul_numba(x, i, j, m):
             x[r, j] = m[0, 1] * col_i[r] + m[1, 1] * col_j[r]
 
 @njit(parallel=True, fastmath=True)
-def leftMatmul_numba(x, i, j, m):
+def leftMatmul_numba(x, i, j, m,  GLOBAL_ROW1, GLOBAL_ROW2, GLOBAL_ROW_ZEROS1, GLOBAL_ROW_ZEROS2):
     n_cols = x.shape[1]
 
-    # copy rows safely
-    row_i = np.empty(n_cols, dtype=x.dtype)
-    row_j = np.empty(n_cols, dtype=x.dtype)
-
     for c in prange(n_cols):
-        row_i[c] = x[i, c]
-        row_j[c] = x[j, c]
+        GLOBAL_ROW1[c] = x[i, c]
+        GLOBAL_ROW2[c] = x[j, c]
+    
+    row_i = GLOBAL_ROW1
+    row_j = GLOBAL_ROW2
 
     for c in prange(n_cols):
         x[i, c] = m[0, 0] * row_i[c] + m[0, 1] * row_j[c]
@@ -216,15 +223,15 @@ def leftMatmul_numba(x, i, j, m):
 
 
 @njit(parallel=True, fastmath=True)
-def leftMatmulTranspose_numba(x, i, j, m):
+def leftMatmulTranspose_numba(x, i, j, m, GLOBAL_ROW1, GLOBAL_ROW2):
     n_cols = x.shape[1]
 
-    row_i = np.empty(n_cols, dtype=x.dtype)
-    row_j = np.empty(n_cols, dtype=x.dtype)
-
     for c in prange(n_cols):
-        row_i[c] = x[i, c]
-        row_j[c] = x[j, c]
+        GLOBAL_ROW1[c] = x[i, c]
+        GLOBAL_ROW2[c] = x[j, c]
+
+    row_i = GLOBAL_ROW1
+    row_j = GLOBAL_ROW2
 
     for c in prange(n_cols):
         x[i, c] = m[0, 0] * row_i[c] + m[1, 0] * row_j[c]
@@ -232,22 +239,22 @@ def leftMatmulTranspose_numba(x, i, j, m):
 
 
 @njit(parallel=True, fastmath=True)
-def rightMatmulTranspose_numba(x, i, j, m):
+def rightMatmulTranspose_numba(x, i, j, m, GLOBAL_COLUMN1, GLOBAL_COLUMN2, GLOBAL_COLUMN_ZEROS1, GLOBAL_COLUMN_ZEROS2):
     n_rows, n_cols = x.shape
 
     if i < n_cols:
-        col_i = np.empty(n_rows, dtype=x.dtype)
         for r in prange(n_rows):
-            col_i[r] = x[r, i]
+            GLOBAL_COLUMN1[r] = x[r, i]
+        col_i = GLOBAL_COLUMN1
     else:
-        col_i = np.zeros(n_rows, dtype=x.dtype)
+        col_i = GLOBAL_COLUMN_ZEROS1
 
     if j < n_cols:
-        col_j = np.empty(n_rows, dtype=x.dtype)
         for r in prange(n_rows):
-            col_j[r] = x[r, j]
+            GLOBAL_COLUMN2[r] = x[r, j]
+        col_j = GLOBAL_COLUMN2
     else:
-        col_j = np.zeros(n_rows, dtype=x.dtype)
+        col_j = GLOBAL_COLUMN_ZEROS2
 
     if i < n_cols:
         for r in prange(n_rows):
@@ -270,11 +277,22 @@ def get_new_vals_numba2(new_vals, jq, x, d, n):
     return new_vals
 
 @njit(parallel=True)
-def get_new_vals_col_numba(r, iq, x, d):
-    new_vals = np.empty()
+def get_new_vals_col_numba(iq, x, d):
+    new_vals = np.empty(iq, dtype=np.float64)
+    col_idx = np.arange(iq)
     for r in range(iq):
-                            self.heap.update_cell_wrapper(r, iq, self.score_fn(r, iq, x, d)[2])
+        new_vals[r] = compute_score_cf_numba(r, iq, x, d)[2]
+    return new_vals, col_idx
 
+@njit(parallel=True)
+def get_new_vals_col_numba2(jq, x, d, p):
+    min_val = min(jq, p)
+    new_vals = np.empty(min_val, dtype=np.float64)
+    col_idx = np.arange(min_val)
+    for r in range(min_val):
+        new_vals[r] = compute_score_cf_numba(r, jq, x, d)[2]
+    return new_vals, col_idx
+                            
 class ApproxSVD():
  
     def __init__(self, n_iter, p, score_method = 'cf', debug_mode = False, jobs = -1, stored_g = False, use_shared_memory = True, use_heap = False):
@@ -509,6 +527,25 @@ class ApproxSVD():
     def fit(self, trueX, u = None):
         d = trueX.shape[0]
         n = trueX.shape[1]
+
+        global GLOBAL_ROW1
+        global GLOBAL_COLUMN1
+        global GLOBAL_COLUMN_ZEROS1
+        global GLOBAL_ROW_ZEROS1
+        GLOBAL_ROW1 = np.empty(n, dtype=np.float64)
+        GLOBAL_COLUMN1 = np.empty(d, dtype=np.float64)
+        GLOBAL_ROW_ZEROS1 = np.zeros(n, dtype=np.float64)
+        GLOBAL_COLUMN_ZEROS1 = np.zeros(d, dtype=np.float64)
+
+        global GLOBAL_ROW2
+        global GLOBAL_COLUMN2
+        global GLOBAL_COLUMN_ZEROS2
+        global GLOBAL_ROW_ZEROS2
+        GLOBAL_ROW2 = np.empty(n, dtype=np.float64)
+        GLOBAL_COLUMN2 = np.empty(d, dtype=np.float64)
+        GLOBAL_ROW_ZEROS2 = np.zeros(n, dtype=np.float64)
+        GLOBAL_COLUMN_ZEROS2 = np.zeros(d, dtype=np.float64)
+
         if u is None:
             u = np.identity(d)
         x = np.array(trueX, copy=True)
@@ -551,14 +588,14 @@ class ApproxSVD():
  
                 # update intermediate x and u
                 with catchtime(self.debug_mode, self.logger, "perform matrix mul"):
-                    rightMatmulTranspose_numba(x, iq, jq, H) # equivalent to x @ H.transpose()
+                    rightMatmulTranspose_numba(x, iq, jq, H, GLOBAL_COLUMN1, GLOBAL_COLUMN2, GLOBAL_COLUMN_ZEROS1, GLOBAL_COLUMN_ZEROS2) # equivalent to x @ H.transpose()
                     if self.stored_g == False:
-                        rightMatmul_numba(u, iq, jq, G) # equivalent to u @ G
+                        rightMatmul_numba(u, iq, jq, G, GLOBAL_COLUMN1, GLOBAL_COLUMN2, GLOBAL_COLUMN_ZEROS1, GLOBAL_COLUMN_ZEROS2) # equivalent to u @ G
                     else:
                         self.g_transforms.append((G, iq, jq))
     
                     if jq < d:
-                        leftMatmulTranspose_numba(x, iq, jq, G) # equivalent to G.transpose() @ x
+                        leftMatmulTranspose_numba(x, iq, jq, G, GLOBAL_ROW1, GLOBAL_ROW2) # equivalent to G.transpose() @ x
  
                 #with catchtime(self.debug_mode, self.logger, "update scores"):
                 # update scores
@@ -584,13 +621,12 @@ class ApproxSVD():
                             self.heap.update_row(jq, new_values_jq)
 
                     with catchtime(self.debug_mode, self.logger, "update cols"):
-                        #new_values_iq = get_new_vals_numba_col(r, iq, x, d)
-                        for r in range(iq):
-                            self.heap.update_cell_wrapper(r, iq, self.score_fn(r, iq, x, d)[2])
+                        new_vals, col_idx = get_new_vals_col_numba(iq, x, d)
+                        self.heap.update_col(new_vals, col_idx, iq)
 
+                        new_vals, col_idx = get_new_vals_col_numba2(jq, x, d, self.p)
+                        self.heap.update_col(new_vals, col_idx, jq)
 
-                        for r in range(min(jq, self.p)):
-                            self.heap.update_cell_wrapper(r, jq, self.score_fn(r, jq, x, d)[2])
                 elif self.use_heap == "basic_heap":
                     for s in range(iq + 1, d):
                         self.heap.update(iq, s, self.score_fn(iq, s, x, d)[2])

@@ -95,6 +95,12 @@ class MatrixHeap:
             # The previous maximum was decreased, need to recalc row maximum
             self.row_max_values[row_idx], self.row_max_indices[row_idx] = find_row_max(self.matrix, row_idx)
             heapq.heappush(self.global_heap, (-self.row_max_values[row_idx], row_idx))
+    
+    def update_col(self, new_vals, rows, col_idx):
+        vals = new_vals.shape[0]
+        for idx in range(vals):
+            self.update_cell_wrapper(rows[idx], col_idx, new_vals[idx])
+
 
     def get_score_matrix(self):
         """Get the entire matrix"""
