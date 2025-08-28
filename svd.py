@@ -552,111 +552,111 @@ class ApproxSVD():
  
         traces = np.array([])
         scores = np.zeros((self.p, n))
-        with catchtime(self.debug_mode, self.logger, "total time"):
+        #with catchtime(self.debug_mode, self.logger, "total time"):
  
-            with catchtime(self.debug_mode, self.logger, "initial scores"):
-                self.assign_fn(self.p, x, scores)
-                
+        #with catchtime(self.debug_mode, self.logger, "initial scores"):
+        self.assign_fn(self.p, x, scores)
+            
+
+        if self.use_heap == "optimized_heap":
+            #with catchtime(self.debug_mode, self.logger, "build heap"):
+            self.heap = MatrixHeap(scores)
+        elif self.use_heap == "basic_heap":
+            #with catchtime(self.debug_mode, self.logger, "build heap"):
+            self.heap = MatrixMaxHeap(scores)
+
+        for q in tqdm(range(self.n_iter)):
+            # get max score from matrix
+            #with catchtime(self.debug_mode, self.logger, "find max score"):
+            if self.use_heap == "optimized_heap" or self.use_heap == "basic_heap":
+                _, iq, jq = self.heap.get_max()
+            else:
+                iq, jq = np.unravel_index(np.argmax(scores), scores.shape)
+
+            if jq >= d:
+                xji = 0
+                xjj = 0
+            else:
+                xji = x[jq][iq]
+                xjj = x[jq][jq]
+            #with catchtime(self.debug_mode, self.logger, "perform small svd"):
+            t = np.array([
+                            [x[iq][iq], x[iq][jq]], 
+                            [xji,       xjj]
+                        ])
+            G, _, H = np.linalg.svd(t)
+
+            # update intermediate x and u
+            #with catchtime(self.debug_mode, self.logger, "perform matrix mul"):
+            rightMatmulTranspose_numba(x, iq, jq, H, GLOBAL_COLUMN1, GLOBAL_COLUMN2, GLOBAL_COLUMN_ZEROS1, GLOBAL_COLUMN_ZEROS2) # equivalent to x @ H.transpose()
+            if self.stored_g == False:
+                rightMatmul_numba(u, iq, jq, G, GLOBAL_COLUMN1, GLOBAL_COLUMN2, GLOBAL_COLUMN_ZEROS1, GLOBAL_COLUMN_ZEROS2) # equivalent to u @ G
+            else:
+                self.g_transforms.append((G, iq, jq))
+
+            if jq < d:
+                leftMatmulTranspose_numba(x, iq, jq, G, GLOBAL_ROW1, GLOBAL_ROW2) # equivalent to G.transpose() @ x
+
+            #with catchtime(self.debug_mode, self.logger, "update scores"):
+            # update scores
+            # Assuming self.use_heap determines whether to use MatrixHeap or plain scores array
 
             if self.use_heap == "optimized_heap":
-                with catchtime(self.debug_mode, self.logger, "build heap"):
-                    self.heap = MatrixHeap(scores)
+                #with catchtime(self.debug_mode, self.logger, "calculate row score"):
+                # Update row iq for all columns from iq+1 to d-1
+                new_values_iq = get_new_vals_numba(self.heap.get_row(iq), iq, x, d)
+                # self.heap.get_row(iq)  # convert back from negative
+                # for s in range(iq + 1, d):
+                #     new_values_iq[s] = self.score_fn(iq, s, x, d)[2]
+                #with catchtime(self.debug_mode, self.logger, "rebuild heap"):
+                self.heap.update_row(iq, new_values_iq)
+
+                if jq < self.p:
+                    # new_values_jq = self.heap.get_row(jq)
+                    # for s in range(jq + 1, n):
+                    #     new_values_jq[s] = self.score_fn(jq, s, x, d)[2]
+                    #with catchtime(self.debug_mode, self.logger, "calculate row score"):
+                    new_values_jq = get_new_vals_numba2(self.heap.get_row(jq), jq, x, d, n)
+                    #with catchtime(self.debug_mode, self.logger, "rebuild heap"):
+                    self.heap.update_row(jq, new_values_jq)
+
+                #with catchtime(self.debug_mode, self.logger, "update cols"):
+                new_vals, col_idx = get_new_vals_col_numba(iq, x, d)
+                self.heap.update_col(new_vals, col_idx, iq)
+
+                new_vals, col_idx = get_new_vals_col_numba2(jq, x, d, self.p)
+                self.heap.update_col(new_vals, col_idx, jq)
+
             elif self.use_heap == "basic_heap":
-                with catchtime(self.debug_mode, self.logger, "build heap"):
-                    self.heap = MatrixMaxHeap(scores)
- 
-            for q in tqdm(range(self.n_iter)):
-                # get max score from matrix
-                #with catchtime(self.debug_mode, self.logger, "find max score"):
-                if self.use_heap == "optimized_heap" or self.use_heap == "basic_heap":
-                    _, iq, jq = self.heap.get_max()
-                else:
-                    iq, jq = np.unravel_index(np.argmax(scores), scores.shape)
- 
-                if jq >= d:
-                    xji = 0
-                    xjj = 0
-                else:
-                    xji = x[jq][iq]
-                    xjj = x[jq][jq]
-                with catchtime(self.debug_mode, self.logger, "perform small svd"):
-                    t = np.array([
-                                    [x[iq][iq], x[iq][jq]], 
-                                    [xji,       xjj]
-                                ])
-                    G, _, H = np.linalg.svd(t)
- 
-                # update intermediate x and u
-                with catchtime(self.debug_mode, self.logger, "perform matrix mul"):
-                    rightMatmulTranspose_numba(x, iq, jq, H, GLOBAL_COLUMN1, GLOBAL_COLUMN2, GLOBAL_COLUMN_ZEROS1, GLOBAL_COLUMN_ZEROS2) # equivalent to x @ H.transpose()
-                    if self.stored_g == False:
-                        rightMatmul_numba(u, iq, jq, G, GLOBAL_COLUMN1, GLOBAL_COLUMN2, GLOBAL_COLUMN_ZEROS1, GLOBAL_COLUMN_ZEROS2) # equivalent to u @ G
-                    else:
-                        self.g_transforms.append((G, iq, jq))
-    
-                    if jq < d:
-                        leftMatmulTranspose_numba(x, iq, jq, G, GLOBAL_ROW1, GLOBAL_ROW2) # equivalent to G.transpose() @ x
- 
-                #with catchtime(self.debug_mode, self.logger, "update scores"):
-                # update scores
-                # Assuming self.use_heap determines whether to use MatrixHeap or plain scores array
+                for s in range(iq + 1, d):
+                    self.heap.update(iq, s, self.score_fn(iq, s, x, d)[2])
 
-                if self.use_heap == "optimized_heap":
-                    with catchtime(self.debug_mode, self.logger, "calculate row score"):
-                        # Update row iq for all columns from iq+1 to d-1
-                        new_values_iq = get_new_vals_numba(self.heap.get_row(iq), iq, x, d)
-                        # self.heap.get_row(iq)  # convert back from negative
-                        # for s in range(iq + 1, d):
-                        #     new_values_iq[s] = self.score_fn(iq, s, x, d)[2]
-                    with catchtime(self.debug_mode, self.logger, "rebuild heap"):
-                        self.heap.update_row(iq, new_values_iq)
+                if jq < self.p:
+                    for s in range(jq + 1, n):
+                        self.heap.update(jq, s, self.score_fn(jq, s, x, d)[2])
 
-                    if jq < self.p:
-                        # new_values_jq = self.heap.get_row(jq)
-                        # for s in range(jq + 1, n):
-                        #     new_values_jq[s] = self.score_fn(jq, s, x, d)[2]
-                        with catchtime(self.debug_mode, self.logger, "calculate row score"):
-                            new_values_jq = get_new_vals_numba2(self.heap.get_row(jq), jq, x, d, n)
-                        with catchtime(self.debug_mode, self.logger, "rebuild heap"):
-                            self.heap.update_row(jq, new_values_jq)
+                for r in range(iq):
+                    self.heap.update(r, iq, self.score_fn(r, iq, x, d)[2])
 
-                    with catchtime(self.debug_mode, self.logger, "update cols"):
-                        new_vals, col_idx = get_new_vals_col_numba(iq, x, d)
-                        self.heap.update_col(new_vals, col_idx, iq)
+                for r in range(min(jq, self.p)):
+                    self.heap.update(r, jq, self.score_fn(r, jq, x, d)[2])
+            
+            else:
+                for s in range(iq + 1, d):
+                    scores[iq][s] = self.score_fn(iq, s, x, d)[2]
+                if jq < self.p:
+                    for s in range(jq + 1, n):
+                        scores[jq][s] = self.score_fn(jq, s, x, d)[2]
+                for r in range(iq):
+                    scores[r][iq] = self.score_fn(r, iq, x, d)[2]
+                for r in range(min(jq, self.p)):
+                    scores[r][jq] = self.score_fn(r, jq, x, d)[2]
 
-                        new_vals, col_idx = get_new_vals_col_numba2(jq, x, d, self.p)
-                        self.heap.update_col(new_vals, col_idx, jq)
-
-                elif self.use_heap == "basic_heap":
-                    for s in range(iq + 1, d):
-                        self.heap.update(iq, s, self.score_fn(iq, s, x, d)[2])
-
-                    if jq < self.p:
-                        for s in range(jq + 1, n):
-                            self.heap.update(jq, s, self.score_fn(jq, s, x, d)[2])
-
-                    for r in range(iq):
-                        self.heap.update(r, iq, self.score_fn(r, iq, x, d)[2])
-
-                    for r in range(min(jq, self.p)):
-                        self.heap.update(r, jq, self.score_fn(r, jq, x, d)[2])
-                
-                else:
-                    for s in range(iq + 1, d):
-                        scores[iq][s] = self.score_fn(iq, s, x, d)[2]
-                    if jq < self.p:
-                        for s in range(jq + 1, n):
-                            scores[jq][s] = self.score_fn(jq, s, x, d)[2]
-                    for r in range(iq):
-                        scores[r][iq] = self.score_fn(r, iq, x, d)[2]
-                    for r in range(min(jq, self.p)):
-                        scores[r][jq] = self.score_fn(r, jq, x, d)[2]
-
-                traces = np.append(traces,  np.trace(x[:self.p, :self.p]))
-            if self.stored_g == True:
-                self.build_ubar(u)
-        print(catchtime.get_stats())
-        catchtime.reset()
+            traces = np.append(traces,  np.trace(x[:self.p, :self.p]))
+        if self.stored_g == True:
+            self.build_ubar(u)
+        #print(catchtime.get_stats())
+        #catchtime.reset()
         return traces, u, x
  
     def _compute_initial_scores_shared(self, x, d, scores):
@@ -705,6 +705,7 @@ class ApproxSVD():
         x_batch = trueX[:, start_index:end_index+1]
         traces = []
         sub_traces, u, x = self.fit(x_batch)
+        i = 1
         while True:
             traces.extend(sub_traces)
             if end_index == n:
@@ -716,5 +717,7 @@ class ApproxSVD():
                 u @ trueX[:, start_index:end_index+1]  # Matrix multiplication, note +1 because Python slicing is exclusive
             ))
             sub_traces, u, x = self.fit(x_batch, u)
+            print(f"Done batch {i}")
+            i += 1
         
         return traces, u, x

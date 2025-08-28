@@ -85,54 +85,54 @@ def run_benchmarks(X, p=50, g=200):
                                stored_g = False,
                                use_shared_memory=False,
                                use_heap="optimized_heap")
-        _, U, X_approx = approx_svd.fit_batched(X, 1400)
+        _, U, X_approx = approx_svd.fit_batched(X, 20000)
         X_reduced = U.T[:p, :] @ X
         X_recon = U[:, :p] @ X_reduced
         return U, None, None, X_recon
     results.append(benchmark("ApproxSVD", run_approx))
 
     #sklearn PCA (full SVD)
-    def run_pca():
-        model = PCA(n_components=p, svd_solver="full")
-        model.fit(X.T)
-        X_recon = model.inverse_transform(model.transform(X.T)).T
-        return model.components_.T, model.singular_values_, None, X_recon
-    results.append(benchmark("PCA (full)", run_pca))
-
-    # Incremental PCA
-    def run_incpca():
-        model = IncrementalPCA(n_components=p, batch_size=1400)
-        model.fit(X.T)
-        X_recon = model.inverse_transform(model.transform(X.T)).T
-        return model.components_.T, None, None, X_recon
-    results.append(benchmark("IncrementalPCA", run_incpca))
-
-     #TruncatedSVD (randomized)
-    def run_tsvd():
-        model = TruncatedSVD(n_components=p)
-        X_reduced = model.fit_transform(X.T)
-        # Reconstruction: approximate, since TSVD doesn't store mean
-        X_recon = (X_reduced @ model.components_).T
-        return model.components_.T, None, None, X_recon
-    results.append(benchmark("TruncatedSVD", run_tsvd))
-
-    def run_oja():
-        model = OjaPCA(
-            n_features=X.shape[0],
-            n_components=p,
-            eta=0.005,
-        )
-        X_tensor = torch.tensor(X.T)
-        b_size = 1400
-        for i in range(0, len(X_tensor) - b_size, b_size):
-            batch = X_tensor[i : i + b_size]
-            if len(batch) < b_size:
-                # This line means we use up to an extra partial batch over 1 pass
-                batch = torch.cat([batch, X_tensor[: b_size - len(batch)]], dim=0)
-            error = model(batch) if hasattr(model, "forward") else None
-        recon = model.inverse_transform(model.transform(X_tensor))
-        return np.array(model.get_components()), None, None, np.array(recon).T
-    results.append(benchmark("OjaPCA", run_oja))
+    # def run_pca():
+    #     model = PCA(n_components=p, svd_solver="full")
+    #     model.fit(X.T)
+    #     X_recon = model.inverse_transform(model.transform(X.T)).T
+    #     return model.components_.T, model.singular_values_, None, X_recon
+    # results.append(benchmark("PCA (full)", run_pca))
+    #
+    # # Incremental PCA
+    # def run_incpca():
+    #     model = IncrementalPCA(n_components=p, batch_size=1400)
+    #     model.fit(X.T)
+    #     X_recon = model.inverse_transform(model.transform(X.T)).T
+    #     return model.components_.T, None, None, X_recon
+    # results.append(benchmark("IncrementalPCA", run_incpca))
+    #
+    #  #TruncatedSVD (randomized)
+    # def run_tsvd():
+    #     model = TruncatedSVD(n_components=p)
+    #     X_reduced = model.fit_transform(X.T)
+    #     # Reconstruction: approximate, since TSVD doesn't store mean
+    #     X_recon = (X_reduced @ model.components_).T
+    #     return model.components_.T, None, None, X_recon
+    # results.append(benchmark("TruncatedSVD", run_tsvd))
+    #
+    # def run_oja():
+    #     model = OjaPCA(
+    #         n_features=X.shape[0],
+    #         n_components=p,
+    #         eta=0.005,
+    #     )
+    #     X_tensor = torch.tensor(X.T)
+    #     b_size = 1400
+    #     for i in range(0, len(X_tensor) - b_size, b_size):
+    #         batch = X_tensor[i : i + b_size]
+    #         if len(batch) < b_size:
+    #             # This line means we use up to an extra partial batch over 1 pass
+    #             batch = torch.cat([batch, X_tensor[: b_size - len(batch)]], dim=0)
+    #         error = model(batch) if hasattr(model, "forward") else None
+    #     recon = model.inverse_transform(model.transform(X_tensor))
+    #     return np.array(model.get_components()), None, None, np.array(recon).T
+    # results.append(benchmark("OjaPCA", run_oja))
 
     # def run_ccipca():
     #     sigma2_0 = 1e-8 * np.ones(p)

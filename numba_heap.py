@@ -1,111 +1,206 @@
-import heapq
 import numpy as np
-from numba import njit, prange
+from numba import njit, prange, set_num_threads, int64, float32
 
-# Numba-optimized functions for matrix operations
+NEG_INF32 = np.finfo(np.float32).min
+
+@njit(parallel=True)
+def build_row_max_parallel(matrix, row_max_values, row_max_indices):
+    """
+    Parallel scan over rows to compute per-row maxima.
+    matrix: float32 2D
+    row_max_values: float32 1D (output)
+    row_max_indices: int64 1D (output)
+    """
+    rows, cols = matrix.shape
+    for i in prange(rows):
+        # local variables for speed
+        maxv = NEG_INF32
+        maxidx = -1
+        # iterate columns
+        for j in range(cols):
+            v = matrix[i, j]
+            if v > maxv:
+                maxv = v
+                maxidx = j
+        row_max_values[i] = maxv
+        row_max_indices[i] = maxidx
+
 @njit
-def find_row_max(matrix, row_idx):
-    """Find maximum value and its index in a row"""
-    max_val = -np.inf
-    max_idx = -1
-    
-    for j in range(matrix.shape[1]):
-        if matrix[row_idx, j] > max_val:
-            max_val = matrix[row_idx, j]
-            max_idx = j
-            
-    return max_val, max_idx
+def _next_pow2(n):
+    size = 1
+    while size < n:
+        size <<= 1
+    return size
 
-@njit(parallel=True)
-def update_matrix_row(matrix, row_idx, new_values):
-    """Update a matrix row"""
-    for j in prange(matrix.shape[1]):
+@njit
+def segtree_build(row_max_values):
+    n = row_max_values.shape[0]
+    size = _next_pow2(n)
+    vals = np.empty(2 * size, dtype=np.float32)
+    idxs = np.empty(2 * size, dtype=np.int64)
+
+    # initialize leaves
+    for i in range(size):
+        if i < n:
+            vals[size + i] = row_max_values[i]
+            idxs[size + i] = i
+        else:
+            vals[size + i] = NEG_INF32
+            idxs[size + i] = -1
+
+    # build parent nodes
+    for i in range(size - 1, 0, -1):
+        left = 2 * i
+        right = left + 1
+        if vals[left] >= vals[right]:
+            vals[i] = vals[left]; idxs[i] = idxs[left]
+        else:
+            vals[i] = vals[right]; idxs[i] = idxs[right]
+
+    return vals, idxs, size
+
+@njit
+def segtree_update(vals, idxs, size, pos, newval):
+    idx = size + pos
+    vals[idx] = newval
+    idxs[idx] = pos
+    idx //= 2
+    while idx >= 1:
+        left = 2 * idx
+        right = left + 1
+        if vals[left] >= vals[right]:
+            vals[idx] = vals[left]; idxs[idx] = idxs[left]
+        else:
+            vals[idx] = vals[right]; idxs[idx] = idxs[right]
+        idx //= 2
+
+@njit
+def segtree_get_max(vals, idxs):
+    return vals[1], idxs[1]
+
+@njit
+def update_row_inplace_f32(matrix, row_idx, new_values,
+                           row_max_values, row_max_indices,
+                           tree_vals, tree_idxs, tree_size):
+    cols = matrix.shape[1]
+    for j in range(cols):
         matrix[row_idx, j] = new_values[j]
-    
-    return matrix
 
-@njit(parallel=True)
-def update_matrix_cell(matrix, row_idx, col_idx, new_value):
-    """Update a single matrix cell"""
+    maxv = NEG_INF32
+    maxidx = -1
+    for j in range(cols):
+        v = matrix[row_idx, j]
+        if v > maxv:
+            maxv = v
+            maxidx = j
+
+    row_max_values[row_idx] = maxv
+    row_max_indices[row_idx] = maxidx
+    segtree_update(tree_vals, tree_idxs, tree_size, row_idx, maxv)
+
+@njit
+def update_cell_inplace_f32(matrix, row_idx, col_idx, new_value,
+                            row_max_values, row_max_indices,
+                            tree_vals, tree_idxs, tree_size):
     matrix[row_idx, col_idx] = new_value
-    return matrix
+    current_max = row_max_values[row_idx]
+
+    if new_value > current_max:
+        # new value becomes the row max
+        row_max_values[row_idx] = new_value
+        row_max_indices[row_idx] = col_idx
+        segtree_update(tree_vals, tree_idxs, tree_size, row_idx, new_value)
+    elif col_idx == row_max_indices[row_idx] and new_value < current_max:
+        # previous maximum decreased; recompute row max
+        maxv = NEG_INF32
+        maxidx = -1
+        cols = matrix.shape[1]
+        for j in range(cols):
+            v = matrix[row_idx, j]
+            if v > maxv:
+                maxv = v
+                maxidx = j
+        row_max_values[row_idx] = maxv
+        row_max_indices[row_idx] = maxidx
+        segtree_update(tree_vals, tree_idxs, tree_size, row_idx, maxv)
+
+@njit
+def update_col_inplace_f32(matrix, new_vals, rows, col_idx,
+                           row_max_values, row_max_indices,
+                           tree_vals, tree_idxs, tree_size):
+
+    m = new_vals.shape[0]
+    for k in range(m):
+        r = rows[k]
+        v = new_vals[k]
+        matrix[r, col_idx] = v
+        current_max = row_max_values[r]
+
+        if v > current_max:
+            row_max_values[r] = v
+            row_max_indices[r] = col_idx
+            segtree_update(tree_vals, tree_idxs, tree_size, r, v)
+        elif col_idx == row_max_indices[r] and v < current_max:
+            # recompute row max
+            maxv = NEG_INF32
+            maxidx = -1
+            cols = matrix.shape[1]
+            for j in range(cols):
+                vv = matrix[r, j]
+                if vv > maxv:
+                    maxv = vv
+                    maxidx = j
+            row_max_values[r] = maxv
+            row_max_indices[r] = maxidx
+            segtree_update(tree_vals, tree_idxs, tree_size, r, maxv)
 
 class MatrixHeap:
+
     def __init__(self, matrix):
-        self.matrix = np.array(matrix, dtype=np.float64)
+        # Ensure contiguous float32 matrix
+        self.matrix = np.ascontiguousarray(matrix, dtype=np.float32)
         self.rows, self.cols = self.matrix.shape
-        
-        # Precompute row maximums
-        self.row_max_values = np.zeros(self.rows, dtype=np.float64)
-        self.row_max_indices = np.zeros(self.rows, dtype=np.int64)
-        
-        # Calculate initial row maximums using Numba-optimized function
-        for i in range(self.rows):
-            self.row_max_values[i], self.row_max_indices[i] = find_row_max(self.matrix, i)
-        
-        # Create a heap for global maximum tracking
-        self.global_heap = []
-        for i in range(self.rows):
-            heapq.heappush(self.global_heap, (-self.row_max_values[i], i))
+
+        # allocate caches in float32/int64
+        self.row_max_values = np.empty(self.rows, dtype=np.float32)
+        self.row_max_indices = np.empty(self.rows, dtype=np.int64)
+
+        # build row maxima in parallel
+        build_row_max_parallel(self.matrix, self.row_max_values, self.row_max_indices)
+
+        # build segtree using float32 vals
+        self.tree_vals, self.tree_idxs, self.tree_size = segtree_build(self.row_max_values)
 
     def get_max(self):
-        """Get the global maximum value and its position"""
-        if not self.global_heap:
-            return -np.inf, -1, -1
-            
-        # Find the row with the current maximum
-        while self.global_heap:
-            neg_val, row_idx = self.global_heap[0]
-            current_max = -neg_val
-            
-            # Check if this row's max is still valid
-            if current_max == self.row_max_values[row_idx]:
-                break
-                
-            heapq.heappop(self.global_heap)
-        else:
-            return -np.inf, -1, -1
-            
-        col_idx = self.row_max_indices[row_idx]
-        return current_max, row_idx, col_idx
+        val, row_idx = segtree_get_max(self.tree_vals, self.tree_idxs)
+        if row_idx < 0:
+            return float(NEG_INF32), -1, -1
+        col_idx = int(self.row_max_indices[row_idx])
+        return float(val), int(row_idx), int(col_idx)
 
     def update_row(self, row_idx, new_values):
-        """Update an entire row"""
-        # Update the matrix using Numba-optimized function
-        self.matrix = update_matrix_row(self.matrix, row_idx, new_values)
-        
-        # Update row maximum using Numba-optimized function
-        self.row_max_values[row_idx], self.row_max_indices[row_idx] = find_row_max(self.matrix, row_idx)
-        
-        # Push updated row to global heap
-        heapq.heappush(self.global_heap, (-self.row_max_values[row_idx], row_idx))
+        new_values = np.ascontiguousarray(new_values, dtype=np.float32)
+        update_row_inplace_f32(self.matrix, row_idx, new_values,
+                               self.row_max_values, self.row_max_indices,
+                               self.tree_vals, self.tree_idxs, self.tree_size)
 
-    def update_cell_wrapper(self, row_idx, col_idx, new_value):
-        """Update a single cell"""
-        # Update the matrix using Numba-optimized function
-        self.matrix = update_matrix_cell(self.matrix, row_idx, col_idx, new_value)
-        
-        # Check if we need to update the row maximum
-        current_max = self.row_max_values[row_idx]
-        if new_value > current_max:
-            self.row_max_values[row_idx] = new_value
-            self.row_max_indices[row_idx] = col_idx
-            heapq.heappush(self.global_heap, (-new_value, row_idx))
-        elif col_idx == self.row_max_indices[row_idx] and new_value < current_max:
-            # The previous maximum was decreased, need to recalc row maximum
-            self.row_max_values[row_idx], self.row_max_indices[row_idx] = find_row_max(self.matrix, row_idx)
-            heapq.heappush(self.global_heap, (-self.row_max_values[row_idx], row_idx))
-    
+    def update_cell(self, row_idx, col_idx, new_value):
+        # ensure new_value is float32
+        nv = np.float32(new_value)
+        update_cell_inplace_f32(self.matrix, row_idx, col_idx, nv,
+                                self.row_max_values, self.row_max_indices,
+                                self.tree_vals, self.tree_idxs, self.tree_size)
+
     def update_col(self, new_vals, rows, col_idx):
-        vals = new_vals.shape[0]
-        for idx in range(vals):
-            self.update_cell_wrapper(rows[idx], col_idx, new_vals[idx])
-
+        # new_vals: 1D numpy array or list; rows: list/1D array of row indices
+        rows_arr = np.ascontiguousarray(rows, dtype=np.int64)
+        new_vals = np.ascontiguousarray(new_vals, dtype=np.float32)
+        update_col_inplace_f32(self.matrix, new_vals, rows_arr, col_idx,
+                               self.row_max_values, self.row_max_indices,
+                               self.tree_vals, self.tree_idxs, self.tree_size)
 
     def get_score_matrix(self):
-        """Get the entire matrix"""
         return self.matrix.copy()
 
     def get_row(self, row_idx):
-        """Get a specific row"""
         return self.matrix[row_idx].copy()
