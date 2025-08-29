@@ -18,6 +18,7 @@ from numba import njit, prange
 from simple_heap import MatrixMaxHeap
 from numba_heap import MatrixHeap
 from line_profiler import profile
+from simple_max import MatrixMax
 
 np.set_printoptions(suppress=True, precision = 4, linewidth = 200)
 
@@ -301,18 +302,18 @@ def get_new_vals_numba2(new_vals, jq, x, d, n):
 
 @njit(parallel=True)
 def get_new_vals_col_numba(iq, x, d):
+    new_vals = np.empty(iq, dtype=np.float64)
     col_idx = np.arange(iq)
-    new_vals = np.empty(iq, dtype = np.float32)
-    for r in prange(iq):
+    for r in range(iq):
         new_vals[r] = compute_score_cf_numba(r, iq, x, d)[2]
     return new_vals, col_idx
 
 @njit(parallel=True)
 def get_new_vals_col_numba2(jq, x, d, p):
     min_val = min(jq, p)
+    new_vals = np.empty(min_val, dtype=np.float64)
     col_idx = np.arange(min_val)
-    new_vals = np.empty(min_val, dtype = np.float32)
-    for r in prange(min_val):
+    for r in range(min_val):
         new_vals[r] = compute_score_cf_numba(r, jq, x, d)[2]
     return new_vals, col_idx
                             
@@ -583,7 +584,7 @@ class ApproxSVD():
 
         if self.use_heap == "optimized_heap":
             #with catchtime(self.debug_mode, self.logger, "build heap"):
-            self.heap = MatrixHeap(scores)
+            self.heap = MatrixMax(scores)
         elif self.use_heap == "basic_heap":
             #with catchtime(self.debug_mode, self.logger, "build heap"):
             self.heap = MatrixMaxHeap(scores)
@@ -633,7 +634,7 @@ class ApproxSVD():
                 # for s in range(iq + 1, d):
                 #     new_values_iq[s] = self.score_fn(iq, s, x, d)[2]
                 #with catchtime(self.debug_mode, self.logger, "rebuild heap"):
-                self.heap.update_row_fast(iq, new_values_iq)
+                self.heap.update_row(iq, new_values_iq)
 
                 if jq < self.p:
                     # new_values_jq = self.heap.get_row(jq)
@@ -642,14 +643,14 @@ class ApproxSVD():
                     #with catchtime(self.debug_mode, self.logger, "calculate row score"):
                     new_values_jq = get_new_vals_numba2(self.heap.get_row(jq), jq, x, d, n)
                     #with catchtime(self.debug_mode, self.logger, "rebuild heap"):
-                    self.heap.update_row_fast(jq, new_values_jq)
+                    self.heap.update_row(jq, new_values_jq)
 
                 #with catchtime(self.debug_mode, self.logger, "update cols"):
                 new_vals, col_idx = get_new_vals_col_numba(iq, x, d)
-                self.heap.update_col_fast(new_vals, col_idx, iq)
+                self.heap.update_col(new_vals, col_idx, iq)
 
                 new_vals, col_idx = get_new_vals_col_numba2(jq, x, d, self.p)
-                self.heap.update_col_fast(new_vals, col_idx, jq)
+                self.heap.update_col(new_vals, col_idx, jq)
 
             elif self.use_heap == "basic_heap":
                 for s in range(iq + 1, d):
