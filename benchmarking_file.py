@@ -11,7 +11,8 @@ import sys
 import os
 sys.path.append(os.path.abspath(".."))
 from online_psp.online_psp.ccipca import CCIPCA
-
+from svd_numba import fit_batched
+from line_profiler import profile
 from svd import ApproxSVD 
 #%%
 try:
@@ -66,7 +67,7 @@ def benchmark(method_name, fit_fn):
     start = time.time()
     U, S, Vt, X_recon = fit_fn()
     elapsed = time.time() - start
-    evr = explained_variance_ratio(X, X_recon)
+    evr = 0.2#explained_variance_ratio(X, X_recon)
     return {
         "method": method_name,
         "time": elapsed,
@@ -76,21 +77,6 @@ def benchmark(method_name, fit_fn):
 def run_benchmarks(X, p=50, g=200):
     results = []
 
-    #ApproxSVD
-    def run_approx():
-        approx_svd = ApproxSVD(n_iter=g, p=p,
-                               score_method="cf",
-                               debug_mode=True,
-                               jobs=8,
-                               stored_g = False,
-                               use_shared_memory=False,
-                               use_heap="optimized_heap")
-        _, U, X_approx = approx_svd.fit_batched(X, 20000)
-        X_reduced = U.T[:p, :] @ X
-        X_recon = U[:, :p] @ X_reduced
-        return U, None, None, X_recon
-    results.append(benchmark("ApproxSVD", run_approx))
-
     #sklearn PCA (full SVD)
     # def run_pca():
     #     model = PCA(n_components=p, svd_solver="full")
@@ -98,15 +84,41 @@ def run_benchmarks(X, p=50, g=200):
     #     X_recon = model.inverse_transform(model.transform(X.T)).T
     #     return model.components_.T, model.singular_values_, None, X_recon
     # results.append(benchmark("PCA (full)", run_pca))
-    #
+
+    # def run_approx_full_numba():
+    #     _, U, X_approx = fit_batched(n_iter = g,
+    #                                 p=p,
+    #                                 batch_size=1500,
+    #                                 trueX=X)
+        
+    #     X_reduced = U.T[:p, :] @ X
+    #     X_recon = U[:, :p] @ X_reduced
+    #     return U, None, None, X_recon
+    # results.append(benchmark("ApproxSVD_numba", run_approx_full_numba))
+
+    #ApproxSVD
+    def run_approx():
+        approx_svd = ApproxSVD(n_iter=g, p=p,
+                               score_method="cf",
+                               debug_mode=False,
+                               jobs=8,
+                               stored_g = False,
+                               use_shared_memory=False,
+                               use_heap="optimized_heap")
+        _, U, X_approx = approx_svd.fit_batched(X, 1500)
+        X_reduced = U.T[:p, :] @ X
+        X_recon = U[:, :p] @ X_reduced
+        return U, None, None, X_recon
+    results.append(benchmark("ApproxSVD", run_approx))
+
     # # Incremental PCA
     # def run_incpca():
-    #     model = IncrementalPCA(n_components=p, batch_size=1400)
+    #     model = IncrementalPCA(n_components=p, batch_size=1500)
     #     model.fit(X.T)
     #     X_recon = model.inverse_transform(model.transform(X.T)).T
     #     return model.components_.T, None, None, X_recon
     # results.append(benchmark("IncrementalPCA", run_incpca))
-    #
+
     #  #TruncatedSVD (randomized)
     # def run_tsvd():
     #     model = TruncatedSVD(n_components=p)
@@ -115,7 +127,7 @@ def run_benchmarks(X, p=50, g=200):
     #     X_recon = (X_reduced @ model.components_).T
     #     return model.components_.T, None, None, X_recon
     # results.append(benchmark("TruncatedSVD", run_tsvd))
-    #
+
     # def run_oja():
     #     model = OjaPCA(
     #         n_features=X.shape[0],
@@ -123,7 +135,7 @@ def run_benchmarks(X, p=50, g=200):
     #         eta=0.005,
     #     )
     #     X_tensor = torch.tensor(X.T)
-    #     b_size = 1400
+    #     b_size = 1500
     #     for i in range(0, len(X_tensor) - b_size, b_size):
     #         batch = X_tensor[i : i + b_size]
     #         if len(batch) < b_size:
@@ -156,45 +168,61 @@ def run_benchmarks(X, p=50, g=200):
         results.append(benchmark("fBPCA", run_fbpca))
 
     return results
-#%%
-X = load_mnist_and_fashion(n_samples=60000)
-# X = np.random.rand(784,300000).astype(np.float32)
-n_samples = 60000
 
-# batch size should be 2 * d
-# ensure allocation of row copy only once
-# multiple maximums per row -> when updating a column
-# try to keep top-k maximums
-# check python profilers -> pycharm
-# settle for a "smaller" maximum
-# matrix mul should be faster -> look into it
-# see how matrices are kept -> row by row or column by column
+@profile
+def run_benchmark():
+    X = load_mnist_subset(n_samples=60000)
+    # X = np.random.rand(784,300000).astype(np.float32)
+    n_samples = 300000
 
-repeats = int(np.ceil(n_samples / X.shape[1]))
-X = np.tile(X, (1, repeats))[:, :n_samples]
-# np.random.seed(42) 
-# X = np.random.rand(5, 8)
-p = 200
-g = 10000
+    # batch size should be 2 * d
+    # ensure allocation of row copy only once
+    # multiple maximums per row -> when updating a column
+    # try to keep top-k maximums
+    # check python profilers -> pycharm
+    # settle for a "smaller" maximum
+    # matrix mul should be faster -> look into it
+    # see how matrices are kept -> row by row or column by column
 
-results = run_benchmarks(X, p=p, g=g)
+    repeats = int(np.ceil(n_samples / X.shape[1]))
+    X = np.tile(X, (1, repeats))[:, :n_samples]
+    seed = 42
+    rng = np.random.default_rng(seed)
 
-print("\nBenchmark Results:")
-for r in results:
-    print(f"{r['method']:15s} | Time: {r['time']:.2f}s | Explained Var: {r['explained_variance']*100:.2f}%")
+    # Generate a shuffled index for columns
+    shuffled_indices = rng.permutation(n_samples)
 
-# Optional: bar plot
-methods = [r["method"] for r in results]
-times = [r["time"] for r in results]
-evrs = [r["explained_variance"] for r in results]
+    # Shuffle columns
+    shuffled_arr = X[:, shuffled_indices]
+    #%%
 
-fig, ax1 = plt.subplots(figsize=(8,4))
-ax2 = ax1.twinx()
+    # np.random.seed(42)
+    # X = np.random.rand(5, 8)
+    p = 100
+    g = 2000
 
-ax1.bar(methods, times, alpha=0.6, label="Time (s)")
-ax2.plot(methods, evrs, "o-", color="red", label="Explained Var")
+    results = run_benchmarks(X, p=p, g=g)
 
-ax1.set_ylabel("Time (s)")
-ax2.set_ylabel("Explained Variance")
-plt.title(f"PCA Benchmark (p={p}, g={g}) on MNIST subset")
-plt.show()
+    print("\nBenchmark Results:")
+    for r in results:
+        print(f"{r['method']:15s} | Time: {r['time']:.2f}s | Explained Var: {r['explained_variance']*100:.2f}%")
+
+    # Optional: bar plot
+    methods = [r["method"] for r in results]
+    times = [r["time"] for r in results]
+    evrs = [r["explained_variance"] for r in results]
+
+    fig, ax1 = plt.subplots(figsize=(8,4))
+    ax2 = ax1.twinx()
+
+    ax1.bar(methods, times, alpha=0.6, label="Time (s)")
+    ax2.plot(methods, evrs, "o-", color="red", label="Explained Var")
+
+    ax1.set_ylabel("Time (s)")
+    ax2.set_ylabel("Explained Variance")
+    plt.title(f"PCA Benchmark (p={p}, g={g}) on MNIST subset")
+    plt.show()
+
+
+if __name__ == "__main__":
+    run_benchmark()

@@ -1,6 +1,6 @@
 import numpy as np
 from numba import njit, prange, set_num_threads, int64, float32
-
+from line_profiler import profile
 NEG_INF32 = np.finfo(np.float32).min
 
 @njit(parallel=True)
@@ -156,6 +156,7 @@ def update_col_inplace_f32(matrix, new_vals, rows, col_idx,
 
 class MatrixHeap:
 
+    @profile
     def __init__(self, matrix):
         # Ensure contiguous float32 matrix
         self.matrix = np.ascontiguousarray(matrix, dtype=np.float32)
@@ -171,6 +172,7 @@ class MatrixHeap:
         # build segtree using float32 vals
         self.tree_vals, self.tree_idxs, self.tree_size = segtree_build(self.row_max_values)
 
+    @profile
     def get_max(self):
         val, row_idx = segtree_get_max(self.tree_vals, self.tree_idxs)
         if row_idx < 0:
@@ -178,12 +180,14 @@ class MatrixHeap:
         col_idx = int(self.row_max_indices[row_idx])
         return float(val), int(row_idx), int(col_idx)
 
+    @profile
     def update_row(self, row_idx, new_values):
         new_values = np.ascontiguousarray(new_values, dtype=np.float32)
         update_row_inplace_f32(self.matrix, row_idx, new_values,
                                self.row_max_values, self.row_max_indices,
                                self.tree_vals, self.tree_idxs, self.tree_size)
 
+    @profile
     def update_cell(self, row_idx, col_idx, new_value):
         # ensure new_value is float32
         nv = np.float32(new_value)
@@ -191,6 +195,7 @@ class MatrixHeap:
                                 self.row_max_values, self.row_max_indices,
                                 self.tree_vals, self.tree_idxs, self.tree_size)
 
+    @profile
     def update_col(self, new_vals, rows, col_idx):
         # new_vals: 1D numpy array or list; rows: list/1D array of row indices
         rows_arr = np.ascontiguousarray(rows, dtype=np.int64)
@@ -199,8 +204,10 @@ class MatrixHeap:
                                self.row_max_values, self.row_max_indices,
                                self.tree_vals, self.tree_idxs, self.tree_size)
 
+    @profile
     def get_score_matrix(self):
-        return self.matrix.copy()
+        return self.matrix
 
+    @profile
     def get_row(self, row_idx):
-        return self.matrix[row_idx].copy()
+        return self.matrix[row_idx]
