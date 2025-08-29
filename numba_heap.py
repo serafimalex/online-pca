@@ -124,13 +124,14 @@ def update_cell_inplace_f32(matrix, row_idx, col_idx, new_value,
         row_max_indices[row_idx] = maxidx
         segtree_update(tree_vals, tree_idxs, tree_size, row_idx, maxv)
 
-@njit
+@njit(parallel=True)
 def update_col_inplace_f32(matrix, new_vals, rows, col_idx,
                            row_max_values, row_max_indices,
                            tree_vals, tree_idxs, tree_size):
-
-    m = new_vals.shape[0]
-    for k in range(m):
+    
+    cols = matrix.shape[1]
+    m = rows.shape[0]
+    for k in prange(m):
         r = rows[k]
         v = new_vals[k]
         matrix[r, col_idx] = v
@@ -144,7 +145,6 @@ def update_col_inplace_f32(matrix, new_vals, rows, col_idx,
             # recompute row max
             maxv = NEG_INF32
             maxidx = -1
-            cols = matrix.shape[1]
             for j in range(cols):
                 vv = matrix[r, j]
                 if vv > maxv:
@@ -181,13 +181,6 @@ class MatrixHeap:
         return float(val), int(row_idx), int(col_idx)
 
     @profile
-    def update_row(self, row_idx, new_values):
-        new_values = np.ascontiguousarray(new_values, dtype=np.float32)
-        update_row_inplace_f32(self.matrix, row_idx, new_values,
-                               self.row_max_values, self.row_max_indices,
-                               self.tree_vals, self.tree_idxs, self.tree_size)
-
-    @profile
     def update_cell(self, row_idx, col_idx, new_value):
         # ensure new_value is float32
         nv = np.float32(new_value)
@@ -195,14 +188,31 @@ class MatrixHeap:
                                 self.row_max_values, self.row_max_indices,
                                 self.tree_vals, self.tree_idxs, self.tree_size)
 
-    @profile
-    def update_col(self, new_vals, rows, col_idx):
-        # new_vals: 1D numpy array or list; rows: list/1D array of row indices
-        rows_arr = np.ascontiguousarray(rows, dtype=np.int64)
-        new_vals = np.ascontiguousarray(new_vals, dtype=np.float32)
-        update_col_inplace_f32(self.matrix, new_vals, rows_arr, col_idx,
+    # FAST versions: no copies or dtype coercion; you promise inputs are correct.
+    def update_row_fast(self, row_idx: int, new_values: np.ndarray):
+        # REQUIRE: new_values.dtype == np.float32 and C-contiguous
+        update_row_inplace_f32(self.matrix, row_idx, new_values,
                                self.row_max_values, self.row_max_indices,
                                self.tree_vals, self.tree_idxs, self.tree_size)
+
+    def update_col_fast(self, new_vals: np.ndarray, rows: np.ndarray, col_idx: int):
+        # REQUIRE: new_vals.dtype == np.float32, rows.dtype == np.int64, both C-contiguous
+        update_col_inplace_f32(self.matrix, new_vals, rows, col_idx,
+                               self.row_max_values, self.row_max_indices,
+                               self.tree_vals, self.tree_idxs, self.tree_size)
+
+    # Keep the existing safe versions for debug or when types are unknown:
+    def update_row(self, row_idx, new_values):
+        if new_values.dtype != np.float32 or not new_values.flags.c_contiguous:
+            new_values = np.ascontiguousarray(new_values, dtype=np.float32)
+        self.update_row_fast(row_idx, new_values)
+
+    def update_col(self, new_vals, rows, col_idx):
+        if not isinstance(rows, np.ndarray) or rows.dtype != np.int64 or not rows.flags.c_contiguous:
+            rows = np.ascontiguousarray(rows, dtype=np.int64)
+        if not isinstance(new_vals, np.ndarray) or new_vals.dtype != np.float32 or not new_vals.flags.c_contiguous:
+            new_vals = np.ascontiguousarray(new_vals, dtype=np.float32)
+        self.update_col_fast(new_vals, rows, col_idx)
 
     @profile
     def get_score_matrix(self):

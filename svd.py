@@ -21,6 +21,18 @@ from line_profiler import profile
 
 np.set_printoptions(suppress=True, precision = 4, linewidth = 200)
 
+GLOBAL_ROW1 = None
+GLOBAL_COLUMN1 = None
+GLOBAL_COLUMN_ZEROS1 = None
+GLOBAL_ROW_ZEROS1 = None
+
+GLOBAL_ROW2 = None
+GLOBAL_COLUMN2 = None
+GLOBAL_COLUMN_ZEROS2 = None
+GLOBAL_ROW_ZEROS2 = None
+
+EPS = 1e-8
+
 class catchtime:
     _totals = defaultdict(lambda: {"time": 0.0, "count": 0})  # stores per-label stats
     
@@ -68,6 +80,7 @@ class catchtime:
             cls._totals.pop(label, None)
         else:
             cls._totals.clear()
+
 
 @njit(parallel=True)
 def compute_and_assign_numba_cf(p, x, scores):
@@ -217,19 +230,31 @@ def leftMatmul_numba(x, i, j, m,  GLOBAL_ROW1, GLOBAL_ROW2, GLOBAL_ROW_ZEROS1, G
 
 
 @njit(parallel=True, fastmath=True)
-def leftMatmulTranspose_numba(x, i, j, m, GLOBAL_ROW1, GLOBAL_ROW2):
-    n_cols = x.shape[1]
+def leftMatmulTranspose_numba(x, i, j, m):
+    n_rows, n_cols = x.shape
 
-    for c in prange(n_cols):
-        GLOBAL_ROW1[c] = x[i, c]
-        GLOBAL_ROW2[c] = x[j, c]
+    # Precompute matrix elements
+    m00 = m[0, 0]
+    m01 = m[0, 1]
+    m10 = m[1, 0]
+    m11 = m[1, 1]
 
-    row_i = GLOBAL_ROW1
-    row_j = GLOBAL_ROW2
-
-    for c in prange(n_cols):
-        x[i, c] = m[0, 0] * row_i[c] + m[1, 0] * row_j[c]
-        x[j, c] = m[0, 1] * row_i[c] + m[1, 1] * row_j[c]
+    if i < n_rows and j < n_rows:
+        # Both rows are valid
+        for c in prange(n_cols):
+            temp_i = x[i, c]
+            temp_j = x[j, c]
+            x[i, c] = m00 * temp_i + m01 * temp_j
+            x[j, c] = m10 * temp_i + m11 * temp_j
+    elif i < n_rows:
+        # Only row i is valid
+        for c in prange(n_cols):
+            x[i, c] = m00 * x[i, c]
+    elif j < n_rows:
+        # Only row j is valid
+        for c in prange(n_cols):
+            x[j, c] = m11 * x[j, c]
+    # If both are invalid → do nothing
 
 
 @njit(parallel=True, fastmath=True)
@@ -264,30 +289,30 @@ def rightMatmulTranspose_numba(x, i, j, m):
  
 @njit(parallel=True)
 def get_new_vals_numba(new_vals, iq, x, d):
-    for s in range(iq + 1, d):
+    for s in prange(iq + 1, d):
         new_vals[s] = compute_score_cf_numba(iq, s, x, d)[2]
     return new_vals
 
 @njit(parallel=True)
 def get_new_vals_numba2(new_vals, jq, x, d, n):
-    for s in range(jq + 1, n):
+    for s in prange(jq + 1, n):
         new_vals[s] = compute_score_cf_numba(jq, s, x, d)[2]
     return new_vals
 
 @njit(parallel=True)
 def get_new_vals_col_numba(iq, x, d):
-    new_vals = np.empty(iq, dtype=np.float64)
     col_idx = np.arange(iq)
-    for r in range(iq):
+    new_vals = np.empty(iq, dtype = np.float32)
+    for r in prange(iq):
         new_vals[r] = compute_score_cf_numba(r, iq, x, d)[2]
     return new_vals, col_idx
 
 @njit(parallel=True)
 def get_new_vals_col_numba2(jq, x, d, p):
     min_val = min(jq, p)
-    new_vals = np.empty(min_val, dtype=np.float64)
     col_idx = np.arange(min_val)
-    for r in range(min_val):
+    new_vals = np.empty(min_val, dtype = np.float32)
+    for r in prange(min_val):
         new_vals[r] = compute_score_cf_numba(r, jq, x, d)[2]
     return new_vals, col_idx
                             
@@ -540,7 +565,7 @@ class ApproxSVD():
         global GLOBAL_COLUMN_ZEROS2
         global GLOBAL_ROW_ZEROS2
         GLOBAL_ROW2 = np.empty(n, dtype=np.float64)
-        GLOBAL_COLUMN2 = np.empty(d, dtype=np.float64)
+        GLOBAL_COLUMN2 = np.empty(d, dtype=np.float32)
         GLOBAL_ROW_ZEROS2 = np.zeros(n, dtype=np.float64)
         GLOBAL_COLUMN_ZEROS2 = np.zeros(d, dtype=np.float64)
 
@@ -593,7 +618,7 @@ class ApproxSVD():
                 self.g_transforms.append((G, iq, jq))
 
             if jq < d:
-                leftMatmulTranspose_numba(x, iq, jq, G, GLOBAL_ROW1, GLOBAL_ROW2) # equivalent to G.transpose() @ x
+                leftMatmulTranspose_numba(x, iq, jq, G)#, GLOBAL_ROW1, GLOBAL_ROW2) # equivalent to G.transpose() @ x
 
             #with catchtime(self.debug_mode, self.logger, "update scores"):
             # update scores
@@ -602,12 +627,13 @@ class ApproxSVD():
             if self.use_heap == "optimized_heap":
                 #with catchtime(self.debug_mode, self.logger, "calculate row score"):
                 # Update row iq for all columns from iq+1 to d-1
+                
                 new_values_iq = get_new_vals_numba(self.heap.get_row(iq), iq, x, d)
                 # self.heap.get_row(iq)  # convert back from negative
                 # for s in range(iq + 1, d):
                 #     new_values_iq[s] = self.score_fn(iq, s, x, d)[2]
                 #with catchtime(self.debug_mode, self.logger, "rebuild heap"):
-                self.heap.update_row(iq, new_values_iq)
+                self.heap.update_row_fast(iq, new_values_iq)
 
                 if jq < self.p:
                     # new_values_jq = self.heap.get_row(jq)
@@ -616,14 +642,14 @@ class ApproxSVD():
                     #with catchtime(self.debug_mode, self.logger, "calculate row score"):
                     new_values_jq = get_new_vals_numba2(self.heap.get_row(jq), jq, x, d, n)
                     #with catchtime(self.debug_mode, self.logger, "rebuild heap"):
-                    self.heap.update_row(jq, new_values_jq)
+                    self.heap.update_row_fast(jq, new_values_jq)
 
                 #with catchtime(self.debug_mode, self.logger, "update cols"):
                 new_vals, col_idx = get_new_vals_col_numba(iq, x, d)
-                self.heap.update_col(new_vals, col_idx, iq)
+                self.heap.update_col_fast(new_vals, col_idx, iq)
 
                 new_vals, col_idx = get_new_vals_col_numba2(jq, x, d, self.p)
-                self.heap.update_col(new_vals, col_idx, jq)
+                self.heap.update_col_fast(new_vals, col_idx, jq)
 
             elif self.use_heap == "basic_heap":
                 for s in range(iq + 1, d):
