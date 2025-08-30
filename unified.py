@@ -256,40 +256,13 @@ def mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_
 
  
 @profile
-def fit(trueX, p, n_iter, u = None):
-    d = trueX.shape[0]
-    n = trueX.shape[1]
+def fit(Xtotal, x, p, n_iter,u,scores, row_max_vals, row_max_idx, traces, batch_i):
+    d = x.shape[0]
+    n = x.shape[1]
 
-    global GLOBAL_ROW1
-    global GLOBAL_COLUMN1
-    global GLOBAL_COLUMN_ZEROS1
-    global GLOBAL_ROW_ZEROS1
-    GLOBAL_ROW1 = np.empty(n, dtype=np.float64)
-    GLOBAL_COLUMN1 = np.empty(d, dtype=np.float64)
-    GLOBAL_ROW_ZEROS1 = np.zeros(n, dtype=np.float64)
-    GLOBAL_COLUMN_ZEROS1 = np.zeros(d, dtype=np.float64)
-
-    global GLOBAL_ROW2
-    global GLOBAL_COLUMN2
-    global GLOBAL_COLUMN_ZEROS2
-    global GLOBAL_ROW_ZEROS2
-    GLOBAL_ROW2 = np.empty(n, dtype=np.float64)
-    GLOBAL_COLUMN2 = np.empty(d, dtype=np.float32)
-    GLOBAL_ROW_ZEROS2 = np.zeros(n, dtype=np.float64)
-    GLOBAL_COLUMN_ZEROS2 = np.zeros(d, dtype=np.float64)
-
-    if u is None:
-        u = np.identity(d)
-    x = np.array(trueX, copy=True)
-
-    traces = np.array([])
-    scores = np.zeros((p, n))
-    row_max_vals = np.full(p, NEG_INF32, dtype = np.float32)
-    row_max_idx = np.full(p, -1, dtype = np.int32)
     compute_and_assign_numba_cf(p, x, scores, row_max_vals, row_max_idx)
     for q in range(n_iter):
         # get max score from matrix
-
         iq, jq = get_max(row_max_vals, row_max_idx)
         if jq >= d:
             xji = 0
@@ -305,13 +278,17 @@ def fit(trueX, p, n_iter, u = None):
         # update intermediate x and u
        
         mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_idx)
+        if q % 3000 == 0:
+            print(f"iteration {q}")
+
+        traces[n_iter*batch_i + q] = np.trace(x[:p, :p])
 
 
 
         #traces = np.append(traces,  np.trace(x[:self.p, :self.p]))
     #print(catchtime.get_stats())
     #catchtime.reset()
-    return traces, u, x
+    return u, x
  
 @profile
 def fit_batched(trueX, p, n_iter, batch_size = 300):
@@ -320,24 +297,39 @@ def fit_batched(trueX, p, n_iter, batch_size = 300):
     if batch_size < d:
         print(f"Batch size too small! Setting to {d}")
         batch_size = d
+
+    total_batches = n // batch_size
+    if n % batch_size != 0:
+        total_batches += 1
+
     start_index = 0
     end_index = min(batch_size, n)
-    x_batch = trueX[:, start_index:end_index+1]
-    traces = []
-    sub_traces, u, x = fit(x_batch, p, n_iter)
-    i = 1
+    x = trueX[:, start_index:end_index+1]
+    x_batch = np.array(x, copy=True)
+
+    u = np.identity(d)
+    scores = np.zeros((p, n), dtype=np.float32)
+    row_max_vals = np.full(p, NEG_INF32, dtype = np.float32)
+    row_max_idx = np.full(p, -1, dtype = np.int64)
+    traces = np.zeros(n_iter * total_batches, dtype = np.float32)
+    i = 0
+    u, x = fit(trueX, x_batch, p, n_iter,u,scores, row_max_vals, row_max_idx, traces, i)
+
     while True:
-        traces.extend(sub_traces)
+        i += 1
+        #traces.extend(sub_traces)
         if end_index == n:
             break
         start_index = start_index + batch_size
         end_index = min(end_index + batch_size, n)
         x_batch = np.hstack((
             x[:, :p],                          
-            u @ trueX[:, start_index:end_index+1]  # Matrix multiplication, note +1 because Python slicing is exclusive
+            u.T @ trueX[:, start_index:end_index]  # Matrix multiplication, note +1 because Python slicing is exclusive
         ))
-        sub_traces, u, x = fit(x_batch,p, n_iter, u)
+        scores = np.zeros((p, n), dtype=np.float32)
+        row_max_vals = np.full(p, NEG_INF32, dtype = np.float32)
+        row_max_idx = np.full(p, -1, dtype = np.int64)
+        u, x = fit(trueX, x_batch, p, n_iter, u, scores, row_max_vals, row_max_idx, traces, i)
         print(f"Done batch {i}")
-        i += 1
     
     return traces, u, x
