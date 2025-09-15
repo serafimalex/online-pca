@@ -11,7 +11,8 @@ import sys
 import os
 sys.path.append(os.path.abspath(".."))
 from online_psp.online_psp.ccipca import CCIPCA
-from svd_numba import fit_batched
+from unified import fit_batched
+#from svd_numba import fit_batched
 from line_profiler import profile
 from svd import ApproxSVD 
 #%%
@@ -97,19 +98,26 @@ def run_benchmarks(X, p=50, g=200):
     # results.append(benchmark("ApproxSVD_numba", run_approx_full_numba))
 
     #ApproxSVD
-    def run_approx():
-        approx_svd = ApproxSVD(n_iter=g, p=p,
-                               score_method="cf",
-                               debug_mode=False,
-                               jobs=8,
-                               stored_g = False,
-                               use_shared_memory=False,
-                               use_heap="optimized_heap")
-        _, U, X_approx = approx_svd.fit_batched(X, 1500)
+    # def run_approx():
+    #     approx_svd = ApproxSVD(n_iter=g, p=p,
+    #                            score_method="cf",
+    #                            debug_mode=False,
+    #                            jobs=8,
+    #                            stored_g = False,
+    #                            use_shared_memory=False,
+    #                            use_heap="optimized_heap")
+    #     _, U, X_approx = approx_svd.fit_batched(X, 1500)
+    #     X_reduced = U.T[:p, :] @ X
+    #     X_recon = U[:, :p] @ X_reduced
+    #     return U, None, None, X_recon
+    # results.append(benchmark("ApproxSVD", run_approx))
+
+    def run_approx_unified():
+        _, U, X_approx = fit_batched(X, p, g, 1500)
         X_reduced = U.T[:p, :] @ X
         X_recon = U[:, :p] @ X_reduced
         return U, None, None, X_recon
-    results.append(benchmark("ApproxSVD", run_approx))
+    results.append(benchmark("ApproxSVD-unified", run_approx_unified))
 
     # # Incremental PCA
     # def run_incpca():

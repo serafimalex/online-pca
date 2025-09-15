@@ -34,6 +34,71 @@ GLOBAL_ROW_ZEROS2 = None
 
 NEG_INF32 = np.float32(-1e30)
 
+@njit
+def svd_2x2(A):
+    """
+    Compute SVD of a 2x2 real matrix A.
+    Returns U, S, Vt such that A = U @ S @ Vt
+    """
+    a, b = A[0, 0], A[0, 1]
+    c, d = A[1, 0], A[1, 1]
+
+    # Form A^T A
+    ata00 = a*a + c*c
+    ata01 = a*b + c*d
+    ata11 = b*b + d*d
+
+    # Eigen-decomposition of 2x2 symmetric matrix [[ata00, ata01],[ata01, ata11]]
+    tr = ata00 + ata11
+    det = ata00*ata11 - ata01*ata01
+    disc = tr*tr - 4*det
+    if disc < 0:
+        disc = 0.0
+    s = np.sqrt(disc)
+
+    # Eigenvalues
+    l1 = 0.5*(tr + s)
+    l2 = 0.5*(tr - s)
+
+    # Sort eigenvalues descending
+    if l1 < l2:
+        l1, l2 = l2, l1
+
+    # Singular values
+    s1 = np.sqrt(l1) if l1 > 0 else 0.0
+    s2 = np.sqrt(l2) if l2 > 0 else 0.0
+
+    # Right singular vectors (columns of V)
+    if ata01 != 0:
+        v1 = np.array([l1 - ata11, ata01], dtype=np.float32)
+        v2 = np.array([l2 - ata11, ata01], dtype=np.float32)
+    else:
+        v1 = np.array([1.0, 0.0], dtype=np.float32)
+        v2 = np.array([0.0, 1.0], dtype=np.float32)
+
+    V = np.column_stack((v1, v2)).astype(np.float32)
+
+    S = np.array([[s1, 0.0],[0.0, s2]], dtype=np.float32)
+
+    U = np.zeros((2,2), dtype=np.float32)
+    if s1 > 1e-12:
+        U[:,0] = (A @ V[:,0]) / s1
+    else:
+        U[:,0] = np.zeros(2, dtype=np.float32)
+
+    if s2 > 1e-12:
+        U[:,1] = (A @ V[:,1]) / s2
+    else:
+        U[:,1] = np.zeros(2, dtype=np.float32)
+
+        # Ensure U is orthogonal (fallback if numerical issues)
+    n1 = np.sqrt(U[0,0]**2 + U[1,0]**2)
+    n2 = np.sqrt(U[0,1]**2 + U[1,1]**2)
+    if n1 > 0: U[:,0] /= n1
+    if n2 > 0: U[:,1] /= n2
+
+    return U, S, V.T
+
 
 @njit(parallel=True)
 def compute_and_assign_numba_cf(p, x, scores, row_max_vals, row_max_idx):
@@ -247,7 +312,6 @@ def mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_
 
     if jq < d:
         leftMatmulTranspose_numba(x, iq, jq, G)
-        
     get_new_vals_numba(scores, iq, x, d, row_max_vals, row_max_idx)   
     if jq < p:
         get_new_vals_numba2(scores, jq, x, d, n, row_max_vals, row_max_idx)   
@@ -255,11 +319,10 @@ def mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_
     get_new_vals_col_numba2(scores, jq, x, d, p, row_max_vals, row_max_idx)
 
  
-@profile
-def fit(Xtotal, x, p, n_iter,u,scores, row_max_vals, row_max_idx, traces, batch_i):
+@njit
+def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i):
     d = x.shape[0]
     n = x.shape[1]
-
     compute_and_assign_numba_cf(p, x, scores, row_max_vals, row_max_idx)
     for q in range(n_iter):
         # get max score from matrix
@@ -268,21 +331,17 @@ def fit(Xtotal, x, p, n_iter,u,scores, row_max_vals, row_max_idx, traces, batch_
             xji = 0
             xjj = 0
         else:
-            xji = x[jq][iq]
-            xjj = x[jq][jq]
-        t = np.array([
-                        [x[iq][iq], x[iq][jq]], 
-                        [xji,       xjj]
-                    ])
+            xji = x[jq, iq]
+            xjj = x[jq, jq]
+        t = np.zeros((2,2), dtype = np.float32)
+        t[0, 0] = x[iq, iq]
+        t[0, 1] = x[iq, jq]
+        t[1, 0] = xji
+        t[1, 1] = xjj
         G, _, H = np.linalg.svd(t)
         # update intermediate x and u
-       
         mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_idx)
-        if q % 3000 == 0:
-            print(f"iteration {q}")
-
-        traces[n_iter*batch_i + q] = np.trace(x[:p, :p])
-
+        traces[n_iter*batch_i + q]= np.trace(x[:p, :p])
 
 
         #traces = np.append(traces,  np.trace(x[:self.p, :self.p]))
@@ -301,7 +360,7 @@ def fit_batched(trueX, p, n_iter, batch_size = 300):
     total_batches = n // batch_size
     if n % batch_size != 0:
         total_batches += 1
-
+    print("Total batches:", total_batches)
     start_index = 0
     end_index = min(batch_size, n)
     x = trueX[:, start_index:end_index+1]
@@ -313,23 +372,22 @@ def fit_batched(trueX, p, n_iter, batch_size = 300):
     row_max_idx = np.full(p, -1, dtype = np.int64)
     traces = np.zeros(n_iter * total_batches, dtype = np.float32)
     i = 0
-    u, x = fit(trueX, x_batch, p, n_iter,u,scores, row_max_vals, row_max_idx, traces, i)
+    u, x = fit(x_batch, p, n_iter,u,scores, row_max_vals, row_max_idx, traces, i)
 
     while True:
         i += 1
-        #traces.extend(sub_traces)
         if end_index == n:
             break
         start_index = start_index + batch_size
         end_index = min(end_index + batch_size, n)
         x_batch = np.hstack((
             x[:, :p],                          
-            u.T @ trueX[:, start_index:end_index]  # Matrix multiplication, note +1 because Python slicing is exclusive
+            u.T @ trueX[:, start_index:end_index+1]  # Matrix multiplication, note +1 because Python slicing is exclusive
         ))
         scores = np.zeros((p, n), dtype=np.float32)
         row_max_vals = np.full(p, NEG_INF32, dtype = np.float32)
         row_max_idx = np.full(p, -1, dtype = np.int64)
-        u, x = fit(trueX, x_batch, p, n_iter, u, scores, row_max_vals, row_max_idx, traces, i)
+        u, x = fit(x_batch, p, n_iter, u, scores, row_max_vals, row_max_idx, traces, i)
         print(f"Done batch {i}")
     
     return traces, u, x
