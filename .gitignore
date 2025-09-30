@@ -9,3 +9,5 @@ __pycache__/
 # Ignore .pyc files
 *.pyc
 __pycache__/svd.cpython-311.pyc
+profiling
+.idea
