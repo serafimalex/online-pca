@@ -29,7 +29,7 @@ GLOBAL_COLUMN_ZEROS2 = None
 GLOBAL_ROW_ZEROS2 = None
 
 NEG_INF32 = np.float32(-1e30)
-NUMBA_THREADS = 8
+NUMBA_THREADS = 16
 
 @njit(parallel=True)
 def compute_and_assign_numba_cf(p, x, scores, row_max_vals, row_max_idx):
@@ -75,79 +75,49 @@ def compute_score_cf_numba(i, j, x, d):
 def rightMatmul_numba(x, i, j, m):
     n_rows, n_cols = x.shape
 
-    # Precompute matrix elements
+    # precompute matrix elements
     m00 = m[0, 0]
     m01 = m[0, 1]
     m10 = m[1, 0]
     m11 = m[1, 1]
 
-    # Handle all cases without temporary copies
     if i < n_cols and j < n_cols:
-        # Both columns are valid - process together
+        # valid columns
         for r in prange(n_rows):
             temp_i = x[r, i]
             temp_j = x[r, j]
             x[r, i] = m00 * temp_i + m10 * temp_j
             x[r, j] = m01 * temp_i + m11 * temp_j
     elif i < n_cols:
-        # Only column i is valid
         for r in prange(n_rows):
             x[r, i] = m00 * x[r, i]
     elif j < n_cols:
-        # Only column j is valid
         for r in prange(n_rows):
             x[r, j] = m11 * x[r, j]
-    # If both are invalid, do nothing
 
 @njit(parallel=True, fastmath=True)
 def rightMatmulTranspose_numba(x, i, j, m):
     n_rows, n_cols = x.shape
 
-    # Precompute matrix elements
     m00 = m[0, 0]
     m01 = m[0, 1]
     m10 = m[1, 0]
     m11 = m[1, 1]
 
-    # Handle all cases without temporary copies
     if i < n_cols and j < n_cols:
-        # Both columns are valid - process together
         for r in prange(n_rows):
             temp_i = x[r, i]
             temp_j = x[r, j]
             x[r, i] = m00 * temp_i + m01 * temp_j
             x[r, j] = m10 * temp_i + m11 * temp_j
     elif i < n_cols:
-        # Only column i is valid
         for r in prange(n_rows):
             temp_i = x[r, i]
-            x[r, i] = m00 * temp_i  # m01 * 0 (j column is treated as zeros)
+            x[r, i] = m00 * temp_i
     elif j < n_cols:
-        # Only column j is valid
         for r in prange(n_rows):
             temp_j = x[r, j]
-            x[r, j] = m11 * temp_j  # m10 * 0 (i column is treated as zeros)
-
-# @njit(parallel=True)
-# def rightMatmul_numba(x, i, j, m, TEMP_COL_2):
-#     n_rows, n_cols = x.shape
- 
-#     if i < n_cols and j < n_cols:
-#         # backup original column i
-#         TEMP_COL_2[:] = x[:, i]
- 
-#         # compute new column i
-#         x[:, i] = m[0, 0] * x[:, i] + m[1, 0] * x[:, j]
- 
-#         # compute new column j
-#         x[:, j] = m[0, 1] * TEMP_COL_2 + m[1, 1] * x[:, j]
- 
-#     elif i < n_cols:
-#         x[:, i] *= m[0, 0]
- 
-#     # Only column j exists
-#     elif j < n_cols:
-#         x[:, j] *= m[1, 1]
+            x[r, j] = m11 * temp_j
 
 
 @njit(parallel=True, fastmath=True)
@@ -171,33 +141,27 @@ def leftMatmul_numba(x, i, j, m,  GLOBAL_ROW1, GLOBAL_ROW2, GLOBAL_ROW_ZEROS1, G
 def leftMatmulTranspose_numba(x, i, j, m):
     n_rows, n_cols = x.shape
 
-    # Precompute matrix elements
     m00 = m[0, 0]
     m01 = m[0, 1]
     m10 = m[1, 0]
     m11 = m[1, 1]
 
     if i < n_rows and j < n_rows:
-        # Both rows are valid
         for c in prange(n_cols):
             temp_i = x[i, c]
             temp_j = x[j, c]
             x[i, c] = m00 * temp_i + m01 * temp_j
             x[j, c] = m10 * temp_i + m11 * temp_j
     elif i < n_rows:
-        # Only row i is valid
         for c in prange(n_cols):
             x[i, c] = m00 * x[i, c]
     elif j < n_rows:
-        # Only row j is valid
         for c in prange(n_cols):
             x[j, c] = m11 * x[j, c]
-    # If both are invalid → do nothing
 
 
 @njit
 def recompute_row_max(scores, row_max_vals, row_max_idx, r):
-    """Fast row maximum recomputation (SIMD-friendly)."""
     max_val = NEG_INF32
     max_idx = -1
     row_sz = scores[r].shape[0]
@@ -255,7 +219,6 @@ def get_max(row_max_vals, row_max_idx):
     r = np.argmax(row_max_vals)
     return r, row_max_idx[r]
                             
-#@njit()
 @njit()
 def mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_idx, TEMP_COL):
     rightMatmulTranspose_numba(x, iq, jq, H)
@@ -276,7 +239,6 @@ def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i, TEMP
     n = x.shape[1]
     compute_and_assign_numba_cf(p, x, scores, row_max_vals, row_max_idx)
     for q in range(n_iter):
-        # get max score from matrix
         iq, jq = get_max(row_max_vals, row_max_idx)
         if jq >= d:
             xji = 0
@@ -292,12 +254,8 @@ def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i, TEMP
         G, _, H = np.linalg.svd(t)
         # update intermediate x and u
         mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_idx, TEMP_COL)
-        traces[n_iter*batch_i + q]= np.trace(x[:p, :p])
+        #traces[n_iter*batch_i + q]= np.trace(x[:p, :p])
 
-
-        #traces = np.append(traces,  np.trace(x[:self.p, :self.p]))
-    #print(catchtime.get_stats())
-    #catchtime.reset()
     return u, x
  
 BUF = None
@@ -328,12 +286,11 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
     start_index = 0
     end_index = min(batch_size, n)
 
-    # Note: original code used end_index+1; keeping that behavior
     x = trueX[:, start_index:end_index+1]
     x_batch = np.array(x, copy=True)
 
     u = np.identity(d)
-    # Allocate once, reuse
+
     scores = np.empty((p, n), dtype=np.float32); scores.fill(0.0)
     row_max_vals = np.empty(p, dtype=np.float32); row_max_vals.fill(NEG_INF32)
     row_max_idx = np.empty(p, dtype=np.int64); row_max_idx.fill(-1)
@@ -341,7 +298,7 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
     traces = np.zeros(n_iter * total_batches, dtype=np.float32)
     i = 0
     u, x = fit(x_batch, p, n_iter, u, scores, row_max_vals, row_max_idx, traces, i, TEMP_COL)
-
+    print(f"Done batch {i}")
     while True:
         i += 1
         if end_index == n:
@@ -355,7 +312,6 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
             u.T @ trueX[:, start_index:end_index+1]
         ))
 
-        # Reset buffers in-place instead of reallocating
         scores.fill(0.0)
         row_max_vals.fill(NEG_INF32)
         row_max_idx.fill(-1)

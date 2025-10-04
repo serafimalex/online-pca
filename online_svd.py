@@ -192,7 +192,6 @@ def leftMatmulTranspose_numba(x, i, j, m):
 
 @njit
 def recompute_row_max(scores, row_max_vals, row_max_idx, r):
-    """Fast row maximum recomputation (SIMD-friendly)."""
     max_val = NEG_INF32
     max_idx = -1
     row_sz = scores[r].shape[0]
