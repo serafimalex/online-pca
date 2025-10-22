@@ -18,17 +18,10 @@ from line_profiler import profile
 
 np.set_printoptions(suppress=True, precision = 4, linewidth = 200)
 
-GLOBAL_ROW1 = None
-GLOBAL_COLUMN1 = None
-GLOBAL_COLUMN_ZEROS1 = None
-GLOBAL_ROW_ZEROS1 = None
+TEMP_COL = None
+TEMP_ROW = None
 
-GLOBAL_ROW2 = None
-GLOBAL_COLUMN2 = None
-GLOBAL_COLUMN_ZEROS2 = None
-GLOBAL_ROW_ZEROS2 = None
-
-TOP_K_SCORES = 3
+TOP_K_SCORES = 5
 
 NEG_INF32 = np.float32(-1e30)
 NUMBA_THREADS = 8
@@ -70,7 +63,6 @@ def compute_and_assign_topk_cf(p, x, scores,
             xii = x[i, i]
             xij = x[i, j]
 
-            # original computation
             if xii * xjj - xij * xji >= 0:
                 diff = xij - xji
                 val = np.sqrt((xii + xjj)**2 + diff**2) - xii - xjj
@@ -80,7 +72,6 @@ def compute_and_assign_topk_cf(p, x, scores,
 
             scores[i, j] = val
 
-            # Insert into top-K buffer for row i
             if val > row_topk_vals[i, TOP_K_SCORES - 1]:
                 k = TOP_K_SCORES - 1
                 while k > 0 and val > row_topk_vals[i, k - 1]:
@@ -108,31 +99,6 @@ def compute_score_cf_numba(i, j, x, d):
 
     return i, j, val
 
-@njit(parallel=True, fastmath=True)
-def rightMatmul_numba(x, i, j, m):
-    n_rows, n_cols = x.shape
-
-    # precompute matrix elements
-    m00 = m[0, 0]
-    m01 = m[0, 1]
-    m10 = m[1, 0]
-    m11 = m[1, 1]
-
-    if i < n_cols and j < n_cols:
-        # valid columns
-        for r in prange(n_rows):
-            temp_i = x[r, i]
-            temp_j = x[r, j]
-            x[r, i] = m00 * temp_i + m10 * temp_j
-            x[r, j] = m01 * temp_i + m11 * temp_j
-    elif i < n_cols:
-        for r in prange(n_rows):
-            x[r, i] = m00 * x[r, i]
-    elif j < n_cols:
-        for r in prange(n_rows):
-            x[r, j] = m11 * x[r, j]
-
-
 def rightMatmul_fast(x, i, j, m):
     n_rows, n_cols = x.shape
 
@@ -156,31 +122,6 @@ def rightMatmul_fast(x, i, j, m):
         x[:, j] *= m11
 
 
-@njit(parallel=True, fastmath=True)
-def rightMatmulTranspose_numba(x, i, j, m):
-    n_rows, n_cols = x.shape
-
-    m00 = m[0, 0]
-    m01 = m[0, 1]
-    m10 = m[1, 0]
-    m11 = m[1, 1]
-
-    if i < n_cols and j < n_cols:
-        for r in prange(n_rows):
-            temp_i = x[r, i]
-            temp_j = x[r, j]
-            x[r, i] = m00 * temp_i + m01 * temp_j
-            x[r, j] = m10 * temp_i + m11 * temp_j
-    elif i < n_cols:
-        for r in prange(n_rows):
-            temp_i = x[r, i]
-            x[r, i] = m00 * temp_i
-    elif j < n_cols:
-        for r in prange(n_rows):
-            temp_j = x[r, j]
-            x[r, j] = m11 * temp_j
-
-
 def rightMatmulTranspose_fast(x, i, j, m):
     n_rows, n_cols = x.shape
 
@@ -202,29 +143,6 @@ def rightMatmulTranspose_fast(x, i, j, m):
 
     elif j_in:
         x[:, j] *= m11
-
-
-@njit(parallel=True, fastmath=True)
-def leftMatmulTranspose_numba(x, i, j, m):
-    n_rows, n_cols = x.shape
-
-    m00 = m[0, 0]
-    m01 = m[0, 1]
-    m10 = m[1, 0]
-    m11 = m[1, 1]
-
-    if i < n_rows and j < n_rows:
-        for c in prange(n_cols):
-            temp_i = x[i, c]
-            temp_j = x[j, c]
-            x[i, c] = m00 * temp_i + m01 * temp_j
-            x[j, c] = m10 * temp_i + m11 * temp_j
-    elif i < n_rows:
-        for c in prange(n_cols):
-            x[i, c] = m00 * x[i, c]
-    elif j < n_rows:
-        for c in prange(n_cols):
-            x[j, c] = m11 * x[j, c]
 
 
 def leftMatmulTranspose_fast(x, i, j, m):   
@@ -374,14 +292,12 @@ def get_new_topk_col_numba(scores, iq, x, d,
         val = compute_score_cf_numba(r, iq, x, d)[2]
         scores[r, iq] = val
 
-        # 1. Check if iq already exists in top-K for this row
         existing_pos = -1
         for k in range(TOP_K_SCORES):
             if row_topk_idx[r, k] == iq:
                 existing_pos = k
                 break
 
-        # 2. If it existed, remove it first
         if existing_pos != -1:
             for k in range(existing_pos, TOP_K_SCORES - 1):
                 row_topk_vals[r, k] = row_topk_vals[r, k + 1]
@@ -389,7 +305,6 @@ def get_new_topk_col_numba(scores, iq, x, d,
             row_topk_vals[r, TOP_K_SCORES - 1] = NEG_INF32
             row_topk_idx[r, TOP_K_SCORES - 1] = -1
 
-        # 3. Insert new value if it qualifies for top-K
         if val > row_topk_vals[r, TOP_K_SCORES - 1]:
             k = TOP_K_SCORES - 1
             while k > 0 and val > row_topk_vals[r, k - 1]:
@@ -399,7 +314,6 @@ def get_new_topk_col_numba(scores, iq, x, d,
             row_topk_vals[r, k] = val
             row_topk_idx[r, k] = iq
 
-        # 4. If after removal we have no top candidate left, trigger recompute
         if row_topk_idx[r, 0] == -1: 
             recompute_row_topk(scores, row_topk_vals, row_topk_idx, r)
 
@@ -424,14 +338,12 @@ def get_new_topk_col_numba2(scores, jq, x, d, p,
         val = compute_score_cf_numba(r, jq, x, d)[2]
         scores[r, jq] = val
 
-        # 1. Check if jq already exists in top-K
         existing_pos = -1
         for k in range(TOP_K_SCORES):
             if row_topk_idx[r, k] == jq:
                 existing_pos = k
                 break
 
-        # 2. Remove old entry if present
         if existing_pos != -1:
             for k in range(existing_pos, TOP_K_SCORES - 1):
                 row_topk_vals[r, k] = row_topk_vals[r, k + 1]
@@ -439,7 +351,6 @@ def get_new_topk_col_numba2(scores, jq, x, d, p,
             row_topk_vals[r, TOP_K_SCORES - 1] = NEG_INF32
             row_topk_idx[r, TOP_K_SCORES - 1] = -1
 
-        # 3. Insert new value if it qualifies for top-K
         if val > row_topk_vals[r, TOP_K_SCORES - 1]:
             k = TOP_K_SCORES - 1
             while k > 0 and val > row_topk_vals[r, k - 1]:
@@ -449,7 +360,6 @@ def get_new_topk_col_numba2(scores, jq, x, d, p,
             row_topk_vals[r, k] = val
             row_topk_idx[r, k] = jq
 
-        # 4. Lazy recompute if top-K becomes empty
         if row_topk_idx[r, 0] == -1:
             recompute_row_topk(scores, row_topk_vals, row_topk_idx, r)
 
@@ -475,22 +385,18 @@ def get_max_topk(row_topk_vals, row_topk_idx):
                             
 # @njit()
 def mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_idx, TEMP_COL):
-    # rightMatmulTranspose_numba(x, iq, jq, H)
     rightMatmulTranspose_fast(x, iq, jq, H)
-    # rightMatmul_numba(u, iq, jq, G)
     rightMatmul_fast(u, iq, jq, G)
 
     if jq < d:
-        # leftMatmulTranspose_numba(x, iq, jq, G)
-        leftMatmulTranspose_fast(x, iq, jq, G)
-    # get_new_vals_numba(scores, iq, x, d, row_max_vals, row_max_idx)  
+        leftMatmulTranspose_fast(x, iq, jq, G) 
+
     get_new_topk_numba(scores, iq, x, d, row_max_vals, row_max_idx) 
-    if jq < p:
-        # get_new_vals_numba2(scores, jq, x, d, n, row_max_vals, row_max_idx)   
+
+    if jq < p:   
         get_new_topk_numba2(scores, jq, x, d, n, row_max_vals, row_max_idx)   
-    # get_new_vals_col_numba(scores, iq, x, d, row_max_vals, row_max_idx) 
+
     get_new_topk_col_numba(scores, iq, x, d, row_max_vals, row_max_idx) 
-    # get_new_vals_col_numba2(scores, jq, x, d, p, row_max_vals, row_max_idx)
     get_new_topk_col_numba2(scores, jq, x, d, p, row_max_vals, row_max_idx)
 
  
@@ -521,20 +427,12 @@ def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i, TEMP
 
     return u, x
  
-BUF = None
-TEMP_COL = None
-TEMP_ROW = None
-
-
 def _init_global_buf(n_rows, n_cols, dtype):
-    global BUF
     global TEMP_COL
     global TEMP_ROW
 
-    if BUF is None:
-        BUF = np.zeros((n_rows, 2), dtype=dtype)
-        TEMP_COL = np.zeros(n_rows, dtype=dtype)
-        TEMP_ROW = np.zeros(n_cols, dtype=dtype)
+    TEMP_COL = np.zeros(n_rows, dtype=dtype)
+    TEMP_ROW = np.zeros(n_cols, dtype=dtype)
         
 def fit_batched(trueX, p, n_iter, batch_size=300):
     set_num_threads(NUMBA_THREADS)
