@@ -423,7 +423,8 @@ def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i, TEMP
         G, _, H = np.linalg.svd(t)
         # update intermediate x and u
         mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_idx, TEMP_COL)
-        #traces[n_iter*batch_i + q]= np.trace(x[:p, :p])
+    
+    traces[n_iter]= np.trace(x[:p, :p])
 
     return u, x
  
