@@ -29,7 +29,7 @@ GLOBAL_COLUMN_ZEROS2 = None
 GLOBAL_ROW_ZEROS2 = None
 
 NEG_INF32 = np.float32(-1e30)
-NUMBA_THREADS = 16
+NUMBA_THREADS = 8
 
 @njit(parallel=True)
 def compute_and_assign_numba_cf(p, x, scores, row_max_vals, row_max_idx):
@@ -95,6 +95,30 @@ def rightMatmul_numba(x, i, j, m):
         for r in prange(n_rows):
             x[r, j] = m11 * x[r, j]
 
+
+def rightMatmul_fast(x, i, j, m):
+    n_rows, n_cols = x.shape
+
+    m00 = m[0, 0]
+    m01 = m[0, 1]
+    m10 = m[1, 0]
+    m11 = m[1, 1]
+
+    i_in = i < n_cols
+    j_in = j < n_cols
+
+    if i_in and j_in:
+        TEMP_COL[:n_rows] = x[:, i]
+        x[:, i] = m00 * TEMP_COL + m10 * x[:, j]
+        x[:, j] = m01 * TEMP_COL + m11 * x[:, j]
+
+    elif i_in:
+        x[:, i] *= m00
+
+    elif j_in:
+        x[:, j] *= m11
+
+
 @njit(parallel=True, fastmath=True)
 def rightMatmulTranspose_numba(x, i, j, m):
     n_rows, n_cols = x.shape
@@ -120,21 +144,27 @@ def rightMatmulTranspose_numba(x, i, j, m):
             x[r, j] = m11 * temp_j
 
 
-@njit(parallel=True, fastmath=True)
-def leftMatmul_numba(x, i, j, m,  GLOBAL_ROW1, GLOBAL_ROW2, GLOBAL_ROW_ZEROS1, GLOBAL_ROW_ZEROS2):
-    n_cols = x.shape[1]
+def rightMatmulTranspose_fast(x, i, j, m):
+    n_rows, n_cols = x.shape
 
-    for c in prange(n_cols):
-        GLOBAL_ROW1[c] = x[i, c]
-        GLOBAL_ROW2[c] = x[j, c]
-    
-    row_i = GLOBAL_ROW1
-    row_j = GLOBAL_ROW2
+    m00 = m[0, 0]
+    m01 = m[0, 1]
+    m10 = m[1, 0]
+    m11 = m[1, 1]
 
-    for c in prange(n_cols):
-        x[i, c] = m[0, 0] * row_i[c] + m[0, 1] * row_j[c]
-        x[j, c] = m[1, 0] * row_i[c] + m[1, 1] * row_j[c]
+    i_in = i < n_cols
+    j_in = j < n_cols
 
+    if i_in and j_in:
+        TEMP_COL[:n_rows] = x[:, i] 
+        x[:, i] = m00 * TEMP_COL + m01 * x[:, j]
+        x[:, j] = m10 * TEMP_COL + m11 * x[:, j]
+
+    elif i_in:
+        x[:, i] *= m00
+
+    elif j_in:
+        x[:, j] *= m11
 
 
 @njit(parallel=True, fastmath=True)
@@ -158,6 +188,29 @@ def leftMatmulTranspose_numba(x, i, j, m):
     elif j < n_rows:
         for c in prange(n_cols):
             x[j, c] = m11 * x[j, c]
+
+
+def leftMatmulTranspose_fast(x, i, j, m):   
+    n_rows, n_cols = x.shape
+
+    m00 = m[0, 0]
+    m01 = m[0, 1]
+    m10 = m[1, 0]
+    m11 = m[1, 1]
+
+    i_in = i < n_rows
+    j_in = j < n_rows
+
+    if i_in and j_in:
+        TEMP_ROW[:n_cols] = x[i, :] 
+        x[i, :] = m00 * TEMP_ROW[:n_cols] + m01 * x[j, :]
+        x[j, :] = m10 * TEMP_ROW[:n_cols] + m11 * x[j, :]
+
+    elif i_in:
+        x[i, :] *= m00
+
+    elif j_in:
+        x[j, :] *= m11
 
 
 @njit
@@ -219,13 +272,16 @@ def get_max(row_max_vals, row_max_idx):
     r = np.argmax(row_max_vals)
     return r, row_max_idx[r]
                             
-@njit()
+# @njit()
 def mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_idx, TEMP_COL):
-    rightMatmulTranspose_numba(x, iq, jq, H)
-    rightMatmul_numba(u, iq, jq, G)
+    # rightMatmulTranspose_numba(x, iq, jq, H)
+    rightMatmulTranspose_fast(x, iq, jq, H)
+    # rightMatmul_numba(u, iq, jq, G)
+    rightMatmul_fast(u, iq, jq, G)
 
     if jq < d:
-        leftMatmulTranspose_numba(x, iq, jq, G)
+        # leftMatmulTranspose_numba(x, iq, jq, G)
+        leftMatmulTranspose_fast(x, iq, jq, G)
     get_new_vals_numba(scores, iq, x, d, row_max_vals, row_max_idx)   
     if jq < p:
         get_new_vals_numba2(scores, jq, x, d, n, row_max_vals, row_max_idx)   
@@ -233,7 +289,7 @@ def mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_
     get_new_vals_col_numba2(scores, jq, x, d, p, row_max_vals, row_max_idx)
 
  
-@njit
+# @njit
 def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i, TEMP_COL):
     d = x.shape[0]
     n = x.shape[1]
@@ -260,23 +316,29 @@ def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i, TEMP
  
 BUF = None
 TEMP_COL = None
-def _init_global_buf(n_rows, dtype):
+TEMP_ROW = None
+
+
+def _init_global_buf(n_rows, n_cols, dtype):
     global BUF
     global TEMP_COL
+    global TEMP_ROW
+
     if BUF is None:
         BUF = np.zeros((n_rows, 2), dtype=dtype)
         TEMP_COL = np.zeros(n_rows, dtype=dtype)
+        TEMP_ROW = np.zeros(n_cols, dtype=dtype)
         
 def fit_batched(trueX, p, n_iter, batch_size=300):
     set_num_threads(NUMBA_THREADS)
     d = trueX.shape[0]
     n = trueX.shape[1]
-    _init_global_buf(d, np.float32)
-    TEMP_COL = np.zeros(d, dtype=np.float32)
 
     if batch_size < d:
         print(f"Batch size too small! Setting to {d}")
         batch_size = d
+
+    _init_global_buf(d, batch_size + p, np.float32)
 
     total_batches = n // batch_size
     if n % batch_size != 0:
@@ -286,14 +348,17 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
     start_index = 0
     end_index = min(batch_size, n)
 
-    x = trueX[:, start_index:end_index+1]
+    x = trueX[:, start_index:end_index]
     x_batch = np.array(x, copy=True)
 
     u = np.identity(d)
 
-    scores = np.empty((p, n), dtype=np.float32); scores.fill(0.0)
-    row_max_vals = np.empty(p, dtype=np.float32); row_max_vals.fill(NEG_INF32)
-    row_max_idx = np.empty(p, dtype=np.int64); row_max_idx.fill(-1)
+    scores = np.empty((p, n), dtype=np.float32)
+    scores.fill(0.0)
+    row_max_vals = np.empty(p, dtype=np.float32)
+    row_max_vals.fill(NEG_INF32)
+    row_max_idx = np.empty(p, dtype=np.int64)
+    row_max_idx.fill(-1)
 
     traces = np.zeros(n_iter * total_batches, dtype=np.float32)
     i = 0
@@ -309,7 +374,7 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
 
         x_batch = np.hstack((
             x[:, :p],
-            u.T @ trueX[:, start_index:end_index+1]
+            u.T @ trueX[:, start_index:end_index]
         ))
 
         scores.fill(0.0)
