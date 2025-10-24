@@ -423,8 +423,6 @@ def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i, TEMP
         G, _, H = np.linalg.svd(t)
         # update intermediate x and u
         mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_idx, TEMP_COL)
-    
-    traces[n_iter]= np.trace(x[:p, :p])
 
     return u, x
  
@@ -434,6 +432,13 @@ def _init_global_buf(n_rows, n_cols, dtype):
 
     TEMP_COL = np.zeros(n_rows, dtype=dtype)
     TEMP_ROW = np.zeros(n_cols, dtype=dtype)
+
+def get_evr(x, u, p):
+    x_reduced = u.T[:p, :] @ x
+    x_recon = u[:, :p] @ x_reduced
+    error = np.linalg.norm(x - x_recon, 'fro') ** 2
+    total = np.linalg.norm(x, 'fro') ** 2
+    return 1 - error / total
         
 def fit_batched(trueX, p, n_iter, batch_size=300):
     set_num_threads(NUMBA_THREADS)
@@ -466,9 +471,11 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
     row_max_idx = np.empty((p, TOP_K_SCORES), dtype=np.int64)
     row_max_idx.fill(-1)
 
-    traces = np.zeros(n_iter * total_batches, dtype=np.float32)
+    traces = np.zeros(total_batches, dtype=np.float32)
     i = 0
     u, x = fit(x_batch, p, n_iter, u, scores, row_max_vals, row_max_idx, traces, i, TEMP_COL)
+   
+    traces[i] = get_evr(trueX, u, p)
     print(f"Done batch {i}")
     while True:
         i += 1
@@ -488,6 +495,7 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
         row_max_idx.fill(-1)
 
         u, x = fit(x_batch, p, n_iter, u, scores, row_max_vals, row_max_idx, traces, i, TEMP_COL)
+        traces[i] = get_evr(trueX, u, p)
         print(f"Done batch {i}")
 
     return traces, u, x
