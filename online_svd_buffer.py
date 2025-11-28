@@ -8,6 +8,7 @@ from time import perf_counter
 from numba import njit
 import numpy as np
 from math import sqrt
+import math
 from joblib import Parallel, delayed
 from collections import defaultdict
 from tqdm import tqdm
@@ -23,7 +24,7 @@ TEMP_ROW = None
 
 TOP_K_SCORES = 5
 
-NEG_INF32 = np.float32(-1e30)
+NEG_INF32 = np.float64(-1e30)
 NUMBA_THREADS = 8
 
 @njit(parallel=True)
@@ -98,6 +99,28 @@ def compute_score_cf_numba(i, j, x, d):
         val = np.sqrt((xii - xjj)**2 + diff**2) - xii - xjj
 
     return i, j, val
+
+@njit(parallel=True)
+def compute_score_nf_numba(i, j, x, d):
+    c = x[j, i] if j < d else 0.0
+    z = x[j, j] if j < d else 0.0
+
+    a = x[i, i]
+    b = x[i, j]
+    
+    t = a*a + c*c
+    d1 = a*z - b*c
+    d2 = d1*d1
+    
+    discriminant = t*t - 4*d2
+    
+    if discriminant < 0:
+        discriminant = 0.0
+    
+    lambda1 = (t + np.sqrt(discriminant)) / 2.0
+    lambda2 = (t - np.sqrt(discriminant)) / 2.0
+    
+    return i, j, np.sqrt(max(lambda1, lambda2)) - a
 
 def rightMatmul_fast(x, i, j, m):
     n_rows, n_cols = x.shape
@@ -188,7 +211,7 @@ def recompute_row_max(scores, row_max_vals, row_max_idx, r):
 def recompute_row_topk(scores, topk_vals, topk_idxs, r):
     row_sz = scores[r].shape[0]
 
-    top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float32)
+    top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float64)
     top_idxs = np.full(TOP_K_SCORES, -1, dtype=np.int32)
 
     for j in range(row_sz):
@@ -211,7 +234,7 @@ def recompute_row_topk(scores, topk_vals, topk_idxs, r):
 @njit(parallel=True)
 def get_new_vals_numba(scores, iq, x, d, row_max_vals, row_max_idx):
     for s in prange(iq + 1, d):
-        val = compute_score_cf_numba(iq, s, x, d)[2]
+        val = compute_score_nf_numba(iq, s, x, d)[2]
         scores[iq][s] = val
         if val > row_max_vals[iq]:
             row_max_vals[iq] = val
@@ -219,11 +242,11 @@ def get_new_vals_numba(scores, iq, x, d, row_max_vals, row_max_idx):
 
 @njit(parallel=True)
 def get_new_topk_numba(scores, iq, x, d, row_topk_vals, row_topk_idx):
-    top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float32)
+    top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float64)
     top_idxs = np.full(TOP_K_SCORES, -1, dtype=np.int32)
 
     for s in prange(iq + 1, d):
-        val = compute_score_cf_numba(iq, s, x, d)[2]
+        val = compute_score_nf_numba(iq, s, x, d)[2]
         scores[iq, s] = val
 
         if val > top_vals[TOP_K_SCORES - 1]:
@@ -243,7 +266,7 @@ def get_new_topk_numba(scores, iq, x, d, row_topk_vals, row_topk_idx):
 @njit(parallel=True)
 def get_new_vals_numba2(scores, jq, x, d, n, row_max_vals, row_max_idx):
     for s in prange(jq + 1, n):
-        val = compute_score_cf_numba(jq, s, x, d)[2]
+        val = compute_score_nf_numba(jq, s, x, d)[2]
         scores[jq][s] = val
         if val > row_max_vals[jq]:
             row_max_vals[jq] = val
@@ -252,11 +275,11 @@ def get_new_vals_numba2(scores, jq, x, d, n, row_max_vals, row_max_idx):
 
 @njit(parallel=True)
 def get_new_topk_numba2(scores, jq, x, d, n, row_topk_vals, row_topk_idx):
-    top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float32)
+    top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float64)
     top_idxs = np.full(TOP_K_SCORES, -1, dtype=np.int32)
 
     for s in prange(jq + 1, n):
-        val = compute_score_cf_numba(jq, s, x, d)[2]
+        val = compute_score_nf_numba(jq, s, x, d)[2]
         scores[jq, s] = val
 
         if val > top_vals[TOP_K_SCORES - 1]:
@@ -276,7 +299,7 @@ def get_new_topk_numba2(scores, jq, x, d, n, row_topk_vals, row_topk_idx):
 @njit(parallel=True)
 def get_new_vals_col_numba(scores, iq, x, d, row_max_vals, row_max_idx):
     for r in prange(iq):
-        val = compute_score_cf_numba(r, iq, x, d)[2]
+        val = compute_score_nf_numba(r, iq, x, d)[2]
         scores[r][iq] = val
         if val > row_max_vals[r]:
             row_max_vals[r] = val
@@ -289,7 +312,7 @@ def get_new_vals_col_numba(scores, iq, x, d, row_max_vals, row_max_idx):
 def get_new_topk_col_numba(scores, iq, x, d,
                            row_topk_vals, row_topk_idx):
     for r in prange(iq):
-        val = compute_score_cf_numba(r, iq, x, d)[2]
+        val = compute_score_nf_numba(r, iq, x, d)[2]
         scores[r, iq] = val
 
         existing_pos = -1
@@ -322,7 +345,7 @@ def get_new_topk_col_numba(scores, iq, x, d,
 def get_new_vals_col_numba2(scores, jq, x, d, p, row_max_vals, row_max_idx):
     min_val = min(jq, p)
     for r in prange(min_val):
-        val = compute_score_cf_numba(r, jq, x, d)[2]
+        val = compute_score_nf_numba(r, jq, x, d)[2]
         scores[r][jq] = val
         if val > row_max_vals[r]:
             row_max_vals[r] = val
@@ -335,7 +358,7 @@ def get_new_topk_col_numba2(scores, jq, x, d, p,
                             row_topk_vals, row_topk_idx):
     min_val = min(jq, p)
     for r in prange(min_val):
-        val = compute_score_cf_numba(r, jq, x, d)[2]
+        val = compute_score_nf_numba(r, jq, x, d)[2]
         scores[r, jq] = val
 
         existing_pos = -1
@@ -415,7 +438,7 @@ def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i, TEMP
         else:
             xji = x[jq, iq]
             xjj = x[jq, jq]
-        t = np.zeros((2,2), dtype = np.float32)
+        t = np.zeros((2,2), dtype = np.float64)
         t[0, 0] = x[iq, iq]
         t[0, 1] = x[iq, jq]
         t[1, 0] = xji
@@ -449,7 +472,7 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
         print(f"Batch size too small! Setting to {d}")
         batch_size = d
 
-    _init_global_buf(d, batch_size + p, np.float32)
+    _init_global_buf(d, batch_size + p, np.float64)
 
     total_batches = n // batch_size
     if n % batch_size != 0:
@@ -464,18 +487,18 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
 
     u = np.identity(d)
 
-    scores = np.empty((p, n), dtype=np.float32)
+    scores = np.empty((p, n), dtype=np.float64)
     scores.fill(0.0)
-    row_max_vals = np.empty((p, TOP_K_SCORES), dtype=np.float32)
+    row_max_vals = np.empty((p, TOP_K_SCORES), dtype=np.float64)
     row_max_vals.fill(NEG_INF32)
     row_max_idx = np.empty((p, TOP_K_SCORES), dtype=np.int64)
     row_max_idx.fill(-1)
 
-    traces = np.zeros(total_batches, dtype=np.float32)
+    traces = np.zeros(total_batches, dtype=np.float64)
     i = 0
     u, x = fit(x_batch, p, n_iter, u, scores, row_max_vals, row_max_idx, traces, i, TEMP_COL)
    
-    traces[i] = get_evr(trueX, u, p)
+    traces[i] = 0 #get_evr(trueX, u, p)
     print(f"Done batch {i}")
     while True:
         i += 1
@@ -495,7 +518,7 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
         row_max_idx.fill(-1)
 
         u, x = fit(x_batch, p, n_iter, u, scores, row_max_vals, row_max_idx, traces, i, TEMP_COL)
-        traces[i] = get_evr(trueX, u, p)
+        traces[i] = 0 #get_evr(trueX, u, p)
         print(f"Done batch {i}")
 
     return traces, u, x
