@@ -25,7 +25,7 @@ TEMP_ROW = None
 TOP_K_SCORES = 5
 
 NEG_INF32 = np.float64(-1e30)
-NUMBA_THREADS = 8
+NUMBA_THREADS = 1
 
 @njit(parallel=True)
 def compute_and_assign_numba_cf(p, x, scores, row_max_vals, row_max_idx):
