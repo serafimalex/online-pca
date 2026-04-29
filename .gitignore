@@ -13,3 +13,6 @@ pyparsvd
 online_psp
 profiling
 .idea
+/npy_chunks
+/arvix-embeddings-dataset
+/dataset_arxiv_2
