@@ -57,9 +57,9 @@ np.set_printoptions(suppress=True, precision=4, linewidth=200)
 NEG_INF32 = np.float64(-1e30)
 NEG_INF = np.float64(-1e30)
 
-# Keep this modest. It is only for resolving duplicate candidates between rows.
-# For p=15, 16 is usually enough; increase to 32 if many rows choose same candidates.
-TOP_CANDIDATES_PER_ROW = 16
+
+# 16 is usually enough, 32 if many rows choose same candidates
+TOP_CANDIDATES_PER_ROW = 32
 
 NUMBA_THREADS = 1
 
@@ -208,7 +208,6 @@ def block_svd_update(x, u, indices):
     if col_indices.size <= 1:
         return u, x
 
-    # Preserve order and remove duplicates.
     seen = set()
     ordered_cols = []
     for idx in col_indices:
@@ -223,15 +222,13 @@ def block_svd_update(x, u, indices):
     if row_indices.size == 0:
         return u, x
 
-    # Small block extraction.
     Xbar = x[np.ix_(row_indices, col_indices)]
 
-    # Need full_matrices=True so V is len(C) x len(C) for rectangular blocks.
+    # full_matrices=True so V is len(C) x len(C) for rectangular blocks
     U_local, _, Vh_local = np.linalg.svd(Xbar, full_matrices=True)
     V_local = Vh_local.T
 
-    # BLAS-backed updates. These are the part expected to benefit from cache/BLAS.
-    # Copying selected rows/cols makes the RHS contiguous and avoids aliasing issues.
+
     x_rows = np.ascontiguousarray(x[row_indices, :])
     x[row_indices, :] = U_local.T @ x_rows
 
@@ -245,13 +242,6 @@ def block_svd_update(x, u, indices):
 
 
 def fit_group_full_recompute(x, p, n_iter, u, top_m=TOP_CANDIDATES_PER_ROW):
-    """
-    Fast group/block inner loop.
-
-    Despite the name, this does not materialize the full score matrix.
-    It fully rescans all candidates after every block update, but only stores
-    top candidates per retained row.
-    """
     if x.dtype != np.float64:
         x = x.astype(np.float64, copy=False)
     if u.dtype != np.float64:
@@ -274,7 +264,6 @@ def fit_group_full_recompute(x, p, n_iter, u, top_m=TOP_CANDIDATES_PER_ROW):
 
         indices = choose_group_from_top_candidates(top_idxs, p, n_active)
 
-        # No candidate beyond [0,...,p-1]
         if indices.size <= p:
             break
 
@@ -292,12 +281,6 @@ def fit(x, p, n_iter, u):
 
 
 def fit_batched(trueX, p, n_iter, batch_size=300, monitor=None, eval_every=1):
-    """
-    Batched / streaming wrapper.
-
-    Returns:
-        traces, u, x
-    """
     trueX = trueX.astype(np.float64, copy=False)
     d_local, n_total = trueX.shape
 
@@ -348,12 +331,6 @@ def fit_batched(trueX, p, n_iter, batch_size=300, monitor=None, eval_every=1):
 
 
 def fit_batched_traced(trueX, p, n_iter, batch_size=300, monitor=None, eval_every=1):
-    """
-    Batched / streaming wrapper.
-
-    Returns:
-        traces, samples_seen, u
-    """
     trueX = trueX.astype(np.float64, copy=False)
     d_local, n_total = trueX.shape
 
