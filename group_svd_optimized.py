@@ -1,4 +1,3 @@
-
 """
 group_svd.py
 
@@ -14,6 +13,7 @@ Main API:
     group_op.fit_batched(...)
     group_op.fit_batched_traced(...)
 
+This version is designed to be faster than the earlier prototype.
 
 Key optimizations:
     1. Does NOT build the full scores matrix.
@@ -65,6 +65,13 @@ NUMBA_THREADS = 1
 
 
 def set_group_num_threads(n):
+    """
+    Optional:
+        group_op.set_group_num_threads(4)
+
+    The block matrix multiplications may also use BLAS threads controlled by
+    environment variables like OMP_NUM_THREADS / MKL_NUM_THREADS.
+    """
     global NUMBA_THREADS
     NUMBA_THREADS = int(n)
     if NUMBA_AVAILABLE:
@@ -88,6 +95,9 @@ def get_evr_on_matrix(X, u, p):
 
 @njit(cache=True)
 def _insert_top_candidate(val, idx, vals, idxs):
+    """
+    Insert val/idx into descending top list if it qualifies.
+    """
     kmax = vals.shape[0]
     if val <= vals[kmax - 1]:
         return
@@ -104,6 +114,14 @@ def _insert_top_candidate(val, idx, vals, idxs):
 
 @njit(parallel=True, cache=True)
 def compute_row_top_candidates_numba(x, p, top_vals, top_idxs):
+    """
+    For each retained row i, scan all valid j > i and keep the top candidates.
+
+    This replaces full score matrix construction.
+
+    top_vals shape: (p, top_m)
+    top_idxs shape: (p, top_m)
+    """
     d_local, n_active = x.shape
     top_m = top_vals.shape[1]
 
@@ -113,6 +131,7 @@ def compute_row_top_candidates_numba(x, p, top_vals, top_idxs):
             top_idxs[i, k] = -1
 
         a = x[i, i]
+        aa = a * a
 
         for j in range(i + 1, n_active):
             b = x[i, j]
@@ -125,12 +144,28 @@ def compute_row_top_candidates_numba(x, p, top_vals, top_idxs):
                 z = 0.0
 
             # sigma_1([[a,b],[c,z]]) from eigenvalues of T T^T
-            aa = a * a + b * b
+            row_sq = aa + b * b           # = a*a + b*b
             cc = c * c + z * z
+
+            # --- Pre-sqrt pruning ---
+            # We want val = sqrt(lam1) - a > threshold.
+            # Since lam1 <= tr = row_sq + cc, we have
+            # sqrt(lam1) <= sqrt(row_sq + cc), so
+            # val <= sqrt(row_sq + cc) - a.
+            # Skip if even this upper bound cannot beat the current worst kept value.
+            threshold = top_vals[i, top_m - 1]
+            # If a + threshold <= 0, the bound below is automatically satisfied
+            # (any non-negative sqrt beats it), so we cannot prune; fall through.
+            ap = a + threshold
+            if ap > 0.0:
+                # Equivalent test without sqrt: row_sq + cc <= ap*ap  =>  prune
+                if row_sq + cc <= ap * ap:
+                    continue
+
             ac = a * c + b * z
 
-            tr = aa + cc
-            det = aa * cc - ac * ac
+            tr = row_sq + cc
+            det = row_sq * cc - ac * ac
             disc = tr * tr - 4.0 * det
 
             if disc < 0.0:
@@ -154,6 +189,11 @@ def compute_row_top_candidates_numba(x, p, top_vals, top_idxs):
 
 
 def choose_group_from_top_candidates(top_idxs, p, n_active):
+    """
+    Build [0,...,p-1, j_0,...] using the first unused candidate from each row.
+
+    This is intentionally simple because p is small.
+    """
     used = set(range(p))
     indices = list(range(p))
 
@@ -230,16 +270,34 @@ def block_svd_update(x, u, indices):
     U_local, _, Vh_local = np.linalg.svd(Xbar, full_matrices=True)
     V_local = Vh_local.T
 
-    # BLAS-backed updates. These are the part expected to benefit from cache/BLAS.
-    # Copying selected rows/cols makes the RHS contiguous and avoids aliasing issues.
-    x_rows = np.ascontiguousarray(x[row_indices, :])
-    x[row_indices, :] = U_local.T @ x_rows
+    # BLAS-backed updates.
+    # Fast path: by construction, choose_group_from_top_candidates always puts
+    # [0, 1, ..., p-1] as the first p entries of the group, so row_indices is
+    # exactly arange(p) and we can use a contiguous slice view instead of
+    # fancy-indexing + ascontiguousarray (which would allocate + copy).
+    p_rows = row_indices.size
+    is_canonical_rows = (
+        p_rows <= d_local
+        and row_indices[0] == 0
+        and row_indices[p_rows - 1] == p_rows - 1
+    )
 
+    if is_canonical_rows:
+        # x[:p_rows, :] is already a contiguous C-order view.
+        x[:p_rows, :] = U_local.T @ x[:p_rows, :]
+    else:
+        x_rows = np.ascontiguousarray(x[row_indices, :])
+        x[row_indices, :] = U_local.T @ x_rows
+
+    # Columns are arbitrary, so we still need to gather them.
     x_cols = np.ascontiguousarray(x[:, col_indices])
     x[:, col_indices] = x_cols @ V_local
 
-    u_cols = np.ascontiguousarray(u[:, row_indices])
-    u[:, row_indices] = u_cols @ U_local
+    if is_canonical_rows:
+        u[:, :p_rows] = u[:, :p_rows] @ U_local
+    else:
+        u_cols = np.ascontiguousarray(u[:, row_indices])
+        u[:, row_indices] = u_cols @ U_local
 
     return u, x
 

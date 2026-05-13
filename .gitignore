@@ -16,3 +16,5 @@ profiling
 /npy_chunks
 /arvix-embeddings-dataset
 /dataset_arxiv_2
+/datasets
+/raw_data
