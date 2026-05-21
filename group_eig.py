@@ -1,57 +1,52 @@
 """
-group_eig.py
+group_eig_buffer.py
 
-Fast Group / Block Online symmetric eigendecomposition (PCA) implementation.
+Group / Block Online EIG.
+
+This is the symmetric (covariance-style) analog of group_svd.py, and the
+group/block extension of online_eig_buffer.py.
+
+Algorithm (per group iteration):
+    1. For each i in [0, p), scan all j > i and keep top_m best j-candidates
+       by score C_ij = lambda_max(S_2x2) - S_ii.
+    2. Greedily assign one unused j to each row i. Build index set
+           idx = [0, 1, ..., p-1,  j_0, j_1, ..., j_{p-1}]   (size 2p)
+    3. Extract block B = S[idx, idx] (size 2p x 2p, symmetric).
+    4. Eigendecompose: B = G_local @ Lambda @ G_local^T.
+    5. Apply similarity transform on the chosen slice of S and right-multiply U:
+           S[idx, :]   = G_local^T @ S[idx, :]
+           S[:, idx]   = S[:, idx]   @ G_local
+           U[:, idx]   = U[:, idx]   @ G_local
+
+Streaming wrapper:
+    OnlineGroupEIG maintains (S, U). Each batch:
+        Y = U^T @ X_new
+        S += Y @ Y^T
+        run k_per_batch group iterations on S
 
 Import:
-    import group_eig as group_op
+    import group_eig_buffer as geb
 
-Main API:
-    group_op.fit_group_full_recompute(s, p, n_iter, u)
-    group_op.fit_group(s, p, n_iter, u)
-    group_op.fit(s, p, n_iter, u)
-    group_op.fit_batched(...)
-    group_op.fit_batched_traced(...)
-
-
-Key optimizations:
-    1. Does NOT build the full scores matrix.
-    2. Computes only the top candidate list per retained row.
-    3. Uses Numba for score scanning.
-    4. Reuses candidate work arrays inside the fit loop.
-    5. Uses BLAS-backed NumPy block updates via np.linalg.eigh (symmetry-aware).
-    6. Avoids np.argsort over full score rows.
-    7. Resymmetrizes S after each iteration to control roundoff drift.
-
-Algorithm (block-parallel variant of Algorithm 1 for symmetric eigendecomposition):
-    For each group iteration:
-        - For every i = 0,...,p-1, scan all j > i and keep top candidates
-          scored by lambda_max(S_tilde_ij) - S_ii, where S_tilde_ij is the
-          2x2 symmetric block [[S_ii, S_ij], [S_ji, S_jj]].
-        - Build group [0,...,p-1, j_0,...,j_{p-1}] using one unused
-          candidate per row (greedy conflict resolution).
-        - Compute eigendecomposition of the selected symmetric block.
-        - Apply the congruence transform G^T S_block G on the selected
-          rows AND columns (same G on both sides, since S is symmetric).
-
-Notes vs. group_svd.py:
-    - S is n x n and symmetric, so there is no rectangular / overcomplete case
-      and no separate left/right transforms. One orthogonal G per pivot.
-    - Score is unified: lambda_max(S_tilde_ij) - S_ii for all (i, j).
-    - tr_p(S) = sum_{t<p} S_tt is a free, natural progress monitor
-      (the running approximation to the sum of top-p eigenvalues, i.e.
-      explained variance for uncentered PCA).
+Drop-in for the benchmark notebook:
+    geb.set_num_threads(geb.NUMBA_THREADS)
+    geb.warmup()
+    tr, t, s, eig = geb.run_group_eig(X, P=P, G=GROUP_G,
+                                       batch_size=ONLINE_BATCH,
+                                       monitor=monitor.astype(np.float64),
+                                       evr_fn=evr_from_U)
 """
 
 import numpy as np
 
 try:
-    from numba import njit, prange, set_num_threads
+    from numba import njit, prange, set_num_threads as _set_num_threads
     NUMBA_AVAILABLE = True
 except Exception:
     NUMBA_AVAILABLE = False
 
     def njit(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
         def deco(fn):
             return fn
         return deco
@@ -59,115 +54,76 @@ except Exception:
     def prange(*args):
         return range(*args)
 
-    def set_num_threads(n):
+    def _set_num_threads(n):
         return None
 
 
-np.set_printoptions(suppress=True, precision=4, linewidth=200)
+# ============================================================
+# MODULE-LEVEL CONSTANTS (mirror online_svd_buffer.py / online_eig_buffer.py)
+# ============================================================
 
+TEMP_COL = None
+TEMP_ROW = None
+TOP_K_SCORES = 5                    # unused here, kept for API parity
+TOP_CANDIDATES_PER_ROW = 32         # like group_svd.py
+NEG_INF32 = np.float64(-1e30)
 NEG_INF = np.float64(-1e30)
-
-
-# 16 is usually enough, 32 if many rows choose same candidates
-TOP_CANDIDATES_PER_ROW = 32
-
 NUMBA_THREADS = 1
 
 
-def set_group_num_threads(n):
+def set_num_threads(k):
     global NUMBA_THREADS
-    NUMBA_THREADS = int(n)
+    NUMBA_THREADS = int(k)
     if NUMBA_AVAILABLE:
-        set_num_threads(NUMBA_THREADS)
+        _set_num_threads(NUMBA_THREADS)
 
 
-def evr_from_recon_sym(S_true, u, p):
-    """
-    Explained variance ratio for symmetric S given an orthonormal basis u.
-
-    EVR = trace(U_p^T S U_p) / trace(S)
-
-    where U_p = u[:, :p]. For uncentered PCA on data X (S = X X^T),
-    this equals the fraction of total variance captured by the top-p
-    components.
-    """
-    U_p = u[:, :p]
-    num = np.trace(U_p.T @ S_true @ U_p)
-    den = np.trace(S_true)
-    if den == 0.0:
-        return 0.0
-    return float(num / den)
+def _init_global_buf(n_rows, n_cols, dtype):
+    """Allocate scratch buffers. Kept for API parity with online_svd_buffer."""
+    global TEMP_COL, TEMP_ROW
+    TEMP_COL = np.zeros(n_rows, dtype=dtype)
+    TEMP_ROW = np.zeros(n_cols, dtype=dtype)
 
 
-def get_evr_on_matrix(S, u, p):
-    return evr_from_recon_sym(S, u, p)
-
-
-def tr_p(s, p):
-    """Sum of the first p diagonal entries of s (spec's progress monitor)."""
-    return float(np.sum(np.diag(s)[:p]))
-
-
-@njit(cache=True)
-def _insert_top_candidate(val, idx, vals, idxs):
-    kmax = vals.shape[0]
-    if val <= vals[kmax - 1]:
-        return
-
-    k = kmax - 1
-    while k > 0 and val > vals[k - 1]:
-        vals[k] = vals[k - 1]
-        idxs[k] = idxs[k - 1]
-        k -= 1
-
-    vals[k] = val
-    idxs[k] = idx
-
+# ============================================================
+# CANDIDATE LIST COMPUTATION (the EIG-flavored score)
+# ============================================================
+# For symmetric S, the 2x2 block at (i,j) is [[S_ii, S_ij], [S_ij, S_jj]].
+# Its largest eigenvalue is:
+#   lambda_max = (S_ii + S_jj)/2 + sqrt(((S_ii - S_jj)/2)^2 + S_ij^2)
+# Score: C_ij = lambda_max - S_ii.
 
 @njit(parallel=True, cache=True)
-def compute_row_top_candidates_numba(s, p, top_vals, top_idxs):
+def compute_row_top_candidates_eig(S, p, top_vals, top_idxs):
     """
-    For each i in 0..p-1, scan j in i+1..n-1 and keep the top_m largest
-    gain scores
+    For each i in [0, p), scan j > i in [0, n) and keep top_m best candidates.
 
-        C_ij = lambda_max(S_tilde_ij) - S_ii
-
-    where S_tilde_ij = [[S_ii, S_ij], [S_ji, S_jj]] (symmetric 2x2).
-
-    The two eigenvalues of a symmetric 2x2 [[a, b], [b, z]] are
-
-        lam = 0.5 * (a + z) +/- 0.5 * sqrt((a - z)^2 + 4 b^2)
-
-    so the discriminant is exactly non-negative; no clamp needed beyond
-    a defensive floor for roundoff.
+    S is symmetric n x n. Writes top_vals (p, top_m) sorted descending
+    and top_idxs (p, top_m) with -1 for empty slots.
     """
-    n_local = s.shape[0]
+    n = S.shape[0]
     top_m = top_vals.shape[1]
 
     for i in prange(p):
+        # reset
         for k in range(top_m):
             top_vals[i, k] = NEG_INF
             top_idxs[i, k] = -1
 
-        a = s[i, i]
+        sii = S[i, i]
 
-        for j in range(i + 1, n_local):
-            b = s[i, j]
-            z = s[j, j]
+        for j in range(i + 1, n):
+            sjj = S[j, j]
+            sij = S[i, j]
 
-            tr = a + z
-            diff = a - z
-            disc = diff * diff + 4.0 * b * b
+            half_sum = 0.5 * (sii + sjj)
+            half_dif = 0.5 * (sii - sjj)
+            radius = np.sqrt(half_dif * half_dif + sij * sij)
+            lmax = half_sum + radius
 
-            # Defensive: disc is mathematically >= 0 for symmetric 2x2,
-            # but floor anyway in case of denormal weirdness.
-            if disc < 0.0:
-                disc = 0.0
+            val = lmax - sii
 
-            lam1 = 0.5 * (tr + np.sqrt(disc))
-            val = lam1 - a
-
-            # inline top insertion for speed
+            # inline top-m insertion
             if val > top_vals[i, top_m - 1]:
                 kk = top_m - 1
                 while kk > 0 and val > top_vals[i, kk - 1]:
@@ -180,9 +136,10 @@ def compute_row_top_candidates_numba(s, p, top_vals, top_idxs):
 
 def choose_group_from_top_candidates(top_idxs, p, n_active):
     """
-    Greedy conflict resolution: for each i in 0..p-1, pick the first
-    candidate in its top-m list that is not yet used. The group always
-    starts with [0, 1, ..., p-1] and is extended by up to p more indices.
+    Greedy: for each i in [0, p), walk its top-m list and claim the first j
+    that isn't already used. Returns indices = [0..p-1, j_0, ..., j_{p-1}].
+
+    Same logic as group_svd.py but with n_active = n for EIG (S is square).
     """
     used = set(range(p))
     indices = list(range(p))
@@ -207,105 +164,106 @@ def choose_group_from_top_candidates(top_idxs, p, n_active):
     return np.asarray(indices, dtype=np.int64)
 
 
-def block_eig_update(s, u, indices):
+# ============================================================
+# BLOCK EIG UPDATE
+# ============================================================
+
+def block_eig_update(S, U, indices):
     """
-    Apply one block congruence update.
+    Apply one block eigen-update.
 
-    Let C be the selected index set (rows AND columns, since S is symmetric).
+    Let idx = indices (size up to 2p). Then:
+        B = S[idx, idx]                          (square, symmetric)
+        B = G_local @ Lambda @ G_local^T         (eigh)
 
-    Sbar = S[C, C]   (a symmetric submatrix)
-    Sbar = G Lambda G^T
+        S[idx, :]   = G_local^T @ S[idx, :]      (left mult on the slice)
+        S[:, idx]   = S[:, idx]   @ G_local      (right mult on the slice)
+        U[:, idx]   = U[:, idx]   @ G_local      (right mult on basis)
 
-    Then:
-        S[C, :] = G^T @ S[C, :]
-        S[:, C] = S[:, C] @ G
-        u[:, C] = u[:, C] @ G
-
-    The columns of G are reordered so that the largest eigenvalues come
-    first; this is what pulls mass onto the leading diagonal of S, which
-    is what the algorithm is optimizing (tr_p).
-
-    After the two-sided update, S is symmetric in exact arithmetic; we
-    resymmetrize in the outer loop to suppress floating-point drift.
+    Eigh returns eigenvalues in ascending order; we reorder so that the largest
+    eigenvalue sits at position 0 of the block, which puts the dominant
+    direction at the smallest index in idx (i.e. at index 0 in the kept block).
+    This convention matches the spirit of the pairwise algorithm where the
+    larger eigenvalue lands at S[i,i].
     """
-    n_local = s.shape[0]
+    n = S.shape[0]
 
-    col_indices = np.asarray(indices, dtype=np.int64)
-    col_indices = col_indices[(col_indices >= 0) & (col_indices < n_local)]
+    # dedupe (defensive: choose_group_from_top_candidates already dedupes,
+    # but indices may include i values that overlap if p > n which is invalid).
+    idx = np.asarray(indices, dtype=np.int64)
+    idx = idx[(idx >= 0) & (idx < n)]
+    if idx.size <= 1:
+        return S, U
 
-    if col_indices.size <= 1:
-        return u, s
-
-    # dedup preserving order
     seen = set()
-    ordered_cols = []
-    for idx in col_indices:
-        ii = int(idx)
+    ordered = []
+    for v in idx:
+        ii = int(v)
         if ii not in seen:
-            ordered_cols.append(ii)
+            ordered.append(ii)
             seen.add(ii)
+    idx = np.asarray(ordered, dtype=np.int64)
 
-    col_indices = np.asarray(ordered_cols, dtype=np.int64)
+    # Extract the symmetric block
+    B = S[np.ix_(idx, idx)]
+    # Symmetrize defensively to suppress floating-point drift
+    B = 0.5 * (B + B.T)
 
-    Sbar = s[np.ix_(col_indices, col_indices)]
+    # Eigendecomposition (ascending eigenvalues). Reverse to descending.
+    eigvals, eigvecs = np.linalg.eigh(B)
+    # eigvecs columns are eigenvectors. Reverse so column 0 = largest.
+    G_local = eigvecs[:, ::-1]
 
-    # Symmetrize Sbar before decomposing to clean up any prior drift.
-    Sbar = 0.5 * (Sbar + Sbar.T)
+    # Apply similarity transform on the slice.
+    # S[idx, :] = G_local^T @ S[idx, :]
+    S_rows = np.ascontiguousarray(S[idx, :])
+    S[idx, :] = G_local.T @ S_rows
 
-    # eigh returns eigenvalues in ascending order; reverse so the largest
-    # land on the lowest indices of the selected block.
-    _, G = np.linalg.eigh(Sbar)
-    G = np.ascontiguousarray(G[:, ::-1])
+    # S[:, idx] = S[:, idx] @ G_local
+    S_cols = np.ascontiguousarray(S[:, idx])
+    S[:, idx] = S_cols @ G_local
 
-    # Congruence update: same G acts on the selected rows (from the left
-    # via G^T) and the selected columns (from the right via G).
-    s_rows = np.ascontiguousarray(s[col_indices, :])
-    s[col_indices, :] = G.T @ s_rows
+    # Re-symmetrize after the slice update (floating-point drift).
+    S = 0.5 * (S + S.T)
 
-    s_cols = np.ascontiguousarray(s[:, col_indices])
-    s[:, col_indices] = s_cols @ G
+    # U[:, idx] = U[:, idx] @ G_local
+    U_cols = np.ascontiguousarray(U[:, idx])
+    U[:, idx] = U_cols @ G_local
 
-    u_cols = np.ascontiguousarray(u[:, col_indices])
-    u[:, col_indices] = u_cols @ G
-
-    return u, s
+    return S, U
 
 
-def fit_group_full_recompute(s, p, n_iter, u, top_m=TOP_CANDIDATES_PER_ROW):
+# ============================================================
+# CORE FIT
+# ============================================================
+
+def fit_group_eig(S, p, n_iter, U, top_m=TOP_CANDIDATES_PER_ROW):
     """
-    Block-parallel one-sided Jacobi-style iteration for symmetric
-    eigendecomposition. Mutates s and u in place (after the dtype cast)
-    and also returns them.
+    Run n_iter group-EIG iterations on S, accumulating rotations into U.
 
     Parameters
     ----------
-    s : (n, n) array, symmetric
-        Working matrix; will be rotated toward block-diagonal form with
-        the leading p-by-p block carrying the top eigenvalues.
+    S : (n, n) float64, symmetric, modified in place
     p : int
-        Target eigenspace dimension; must satisfy p <= n.
     n_iter : int
-        Number of outer iterations. Each outer iteration applies one
-        block congruence on up to 2p indices.
-    u : (n, n) array
-        Running orthonormal basis; the first p columns approximate the
-        top-p eigenvectors on return.
-    top_m : int
-        Candidates retained per pivot row.
+    U : (n, n) float64, modified in place
+    top_m : int, candidate-list width per row
+
+    Returns
+    -------
+    U, S (the modified arrays; returning them keeps API symmetry with the SVD class)
     """
-    if s.dtype != np.float64:
-        s = s.astype(np.float64, copy=False)
-    if u.dtype != np.float64:
-        u = u.astype(np.float64, copy=False)
+    if S.dtype != np.float64:
+        S = S.astype(np.float64, copy=False)
+    if U.dtype != np.float64:
+        U = U.astype(np.float64, copy=False)
 
-    n_local = s.shape[0]
-    if s.shape[1] != n_local:
-        raise ValueError(f"s must be square. Got shape {s.shape}.")
-
-    if p > n_local:
-        raise ValueError(f"p must be <= n. Got p={p}, n={n_local}.")
-    if p >= n_local:
-        return u, s
+    n = S.shape[0]
+    if p > n:
+        raise ValueError(f"p must be <= n. Got p={p}, n={n}.")
+    if p >= n:
+        # No j > i in [0, n) for any i < p when p == n, nothing to do.
+        return U, S
 
     top_m = int(max(1, top_m))
 
@@ -313,216 +271,197 @@ def fit_group_full_recompute(s, p, n_iter, u, top_m=TOP_CANDIDATES_PER_ROW):
     top_idxs = np.empty((p, top_m), dtype=np.int64)
 
     for _ in range(int(n_iter)):
-        compute_row_top_candidates_numba(s, p, top_vals, top_idxs)
+        compute_row_top_candidates_eig(S, p, top_vals, top_idxs)
 
-        indices = choose_group_from_top_candidates(top_idxs, p, n_local)
+        indices = choose_group_from_top_candidates(top_idxs, p, n)
 
         if indices.size <= p:
+            # No usable partners — all candidates exhausted. Bail.
             break
 
-        u, s = block_eig_update(s, u, indices)
+        S, U = block_eig_update(S, U, indices)
 
-        # Resymmetrize to control roundoff drift from the two-sided update.
-        s = 0.5 * (s + s.T)
-
-    return u, s
+    return U, S
 
 
-def fit_group(s, p, n_iter, u):
-    return fit_group_full_recompute(s, p, n_iter, u)
+# Aliases for API parity with group_svd.py
+def fit_group_full_recompute(S, p, n_iter, u, top_m=TOP_CANDIDATES_PER_ROW):
+    """Alias matching group_svd.fit_group_full_recompute signature."""
+    return fit_group_eig(S, p, n_iter, u, top_m=top_m)
 
 
-def fit(s, p, n_iter, u):
-    return fit_group_full_recompute(s, p, n_iter, u)
+def fit_group(S, p, n_iter, u):
+    return fit_group_eig(S, p, n_iter, u)
 
 
-def _accumulate_covariance(X_batch):
+def fit(S, p, n_iter, u):
+    return fit_group_eig(S, p, n_iter, u)
+
+
+# ============================================================
+# STREAMING WRAPPER
+# ============================================================
+
+class OnlineGroupEIG:
     """
-    Form S_batch = X_batch @ X_batch.T for an (n, b) data slice.
-    No centering is applied; this is uncentered PCA / eigendecomposition
-    of the scatter matrix. If the caller wants centered PCA they should
-    center X before passing it in.
+    Streaming group/block EIG.
+
+    Lifecycle:
+        eig = OnlineGroupEIG(n=d, p=P, k_per_batch=GROUP_G)
+        for batch in stream:           # batch is (n, m)
+            eig.partial_fit(batch)
+        U = eig.U_
+
+    State (bounded regardless of stream length):
+        self.S_ : (n, n) running second-moment matrix in U's frame
+        self.U_ : (n, n) accumulated rotation; first p columns = approx top-p basis
     """
-    return X_batch @ X_batch.T
+
+    def __init__(self, n, p, k_per_batch=33, top_m=TOP_CANDIDATES_PER_ROW, dtype=np.float64):
+        self.n = n
+        self.p = p
+        self.k_per_batch = k_per_batch
+        self.top_m = top_m
+        self.dtype = dtype
+
+        self.S_ = np.zeros((n, n), dtype=dtype)
+        self.U_ = np.eye(n, dtype=dtype)
+
+        _init_global_buf(n, n, dtype)
+
+        self.n_samples_seen_ = 0
+        self._first_batch = True
+
+    def partial_fit(self, X_batch, warmstart=None):
+        """
+        Fold a new batch into S and run k_per_batch group iterations.
+
+        Parameters
+        ----------
+        X_batch : (n, m) float
+        warmstart : callable(S, U, p) -> (S, U) or None
+            Applied only on the first batch, after covariance accumulation
+            but before the group iterations.
+        """
+        Xb = np.asarray(X_batch, dtype=self.dtype)
+        # Project into U's frame
+        Y = self.U_.T @ Xb               # (n, m)
+        # Rank-m symmetric update
+        self.S_ += Y @ Y.T
+        # Symmetrize defensively
+        self.S_ = 0.5 * (self.S_ + self.S_.T)
+
+        if self._first_batch and warmstart is not None:
+            warmstart(self.S_, self.U_, self.p)
+        if self._first_batch:
+            self._first_batch = False
+
+        # Run group iterations
+        self.U_, self.S_ = fit_group_eig(
+            self.S_, self.p, self.k_per_batch, self.U_, top_m=self.top_m
+        )
+
+        self.n_samples_seen_ += Xb.shape[1]
+        return self
+
+    @property
+    def components_(self):
+        """First p eigenvectors as rows (sklearn convention)."""
+        return self.U_[:, :self.p].T
+
+    def transform(self, X):
+        return self.U_[:, :self.p].T @ np.asarray(X, dtype=self.dtype)
+
+    def inverse_transform(self, codes):
+        return self.U_[:, :self.p] @ np.asarray(codes, dtype=self.dtype)
 
 
-def fit_batched(trueX, p, n_iter, batch_size=300, monitor=None, eval_every=1):
+# ============================================================
+# CONVENIENCE NOTEBOOK DRIVER
+# ============================================================
+
+def run_group_eig(X, P, G, batch_size, monitor, evr_fn,
+                  top_m=TOP_CANDIDATES_PER_ROW, warmstart=None):
     """
-    Streaming/online eigendecomposition over a data matrix trueX of shape
-    (n, N). Internally accumulates uncentered covariance contributions
-    per batch and applies block-eig iterations.
-
-    Deflation between batches: after processing a batch, the running
-    S in the current rotated basis has its top-p-by-p block carrying
-    the approximate leading eigenvalues. We keep that top block, drop
-    the trailing (n-p)-by-(n-p) corner (treated as residual), and fold
-    in the next batch's contribution computed in the current basis:
-
-        Y_new = u.T @ X_new
-        S_next[:p, :p] = S[:p, :p] + Y_new[:p, :] @ Y_new[:p, :].T
-        S_next[:p, p:] = Y_new[:p, :] @ Y_new[p:, :].T
-        S_next[p:, :p] = S_next[:p, p:].T
-        S_next[p:, p:] = Y_new[p:, :] @ Y_new[p:, :].T
-
-    The top-p rows/cols therefore retain accumulated information from
-    all prior batches, while the orthogonal complement is reset each
-    batch from the latest contribution only. This is the symmetric
-    analog of the SVD code's `hstack((x[:, :p], u.T @ X_new))` deflation.
+    Benchmark-shape streaming driver.
 
     Parameters
     ----------
-    trueX : (n, N) array
-        Full data stream.
-    p : int
-        Target eigenspace dimension.
-    n_iter : int
-        Iterations per batch.
+    X : (d, n_total) float
+    P : int — components
+    G : int — group iterations per batch (e.g. GROUP_G = G_pairwise // P)
     batch_size : int
-        Number of data columns per batch. Forced up to n if smaller.
-    monitor : (n, n) array or None
-        If provided, an external symmetric reference matrix used to
-        compute EVR after each batch (for tracking convergence). If
-        None, falls back to tr_p of the running matrix.
-    eval_every : int
-        How often (in batches) to recompute the EVR/tr_p trace.
+    monitor : (d, m)
+    evr_fn : callable(monitor, U, P) -> float
+    top_m : int — width of per-row candidate lists
+    warmstart : callable(S, U, p) -> (S, U) or None.
+        Applied ONLY on the first batch, between covariance accumulation
+        and the first group iterations.
 
     Returns
     -------
-    traces : (used_batches,) array
-        Progress metric after each batch (EVR if monitor given, else tr_p).
-    u : (n, n) array
-        Approximate eigenbasis; first p columns are the leading components.
-    s : (n, n) array
-        Final working symmetric matrix in the rotated basis.
+    tr, time_axis, samples, eig
     """
-    trueX = trueX.astype(np.float64, copy=False)
-    n_local, n_total = trueX.shape
+    import time
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        def tqdm(it, **kwargs):
+            return it
 
-    if p > n_local:
-        raise ValueError(f"p must be <= n. Got p={p}, n={n_local}.")
+    d = X.shape[0]
+    n_total = X.shape[1]
+    batch_size = max(batch_size, d)
 
-    if batch_size < n_local:
-        print(f"Batch size too small! Setting to {n_local}")
-        batch_size = n_local
+    eig = OnlineGroupEIG(n=d, p=P, k_per_batch=G, top_m=top_m)
+
+    tr, time_axis, samples = [], [], []
+    samples_seen = 0
+    fit_time_accum = 0.0
 
     total_batches = n_total // batch_size + (1 if n_total % batch_size else 0)
 
-    u = np.identity(n_local, dtype=np.float64)
-    s = np.zeros((n_local, n_local), dtype=np.float64)
-    traces = np.zeros(total_batches, dtype=np.float64)
+    start = 0
+    for _ in tqdm(range(total_batches), desc="GroupEIG batches"):
+        end = min(start + batch_size, n_total)
+        batch = X[:, start:end]
 
-    start_index = 0
-    end_index = min(batch_size, n_total)
+        t0 = time.perf_counter()
+        eig.partial_fit(batch, warmstart=warmstart)
+        t1 = time.perf_counter()
 
-    # First batch: form S from scratch in the original (identity) basis.
-    X_batch = trueX[:, start_index:end_index]
-    s = _accumulate_covariance(X_batch)
-    s = 0.5 * (s + s.T)
+        fit_time_accum += t1 - t0
+        samples_seen += end - start
 
-    last_trace = 0.0
-    used_batches = 0
+        time_axis.append(fit_time_accum)
+        samples.append(samples_seen)
+        tr.append(evr_fn(monitor, eig.U_, P))
 
-    for bi in range(total_batches):
-        u, s = fit_group_full_recompute(s, p, n_iter, u)
-
-        if monitor is not None:
-            if bi % eval_every == 0:
-                last_trace = get_evr_on_matrix(
-                    monitor.astype(np.float64, copy=False), u, p
-                )
-            traces[bi] = last_trace
-        else:
-            traces[bi] = tr_p(s, p)
-
-        used_batches = bi + 1
-
-        if end_index == n_total:
+        start = end
+        if start >= n_total:
             break
 
-        start_index += batch_size
-        end_index = min(end_index + batch_size, n_total)
-
-        # Deflate and fold in the next batch in the current basis.
-        X_next = trueX[:, start_index:end_index]
-        Y_new = u.T @ X_next                       # (n, b_next)
-        Y_top = Y_new[:p, :]
-        Y_bot = Y_new[p:, :]
-
-        s_next = np.empty_like(s)
-        s_next[:p, :p] = s[:p, :p] + Y_top @ Y_top.T
-        s_next[:p, p:] = Y_top @ Y_bot.T
-        s_next[p:, :p] = s_next[:p, p:].T
-        s_next[p:, p:] = Y_bot @ Y_bot.T
-
-        s = 0.5 * (s_next + s_next.T)
-
-    return traces[:used_batches], u, s
+    return np.array(tr), np.array(time_axis), np.array(samples), eig
 
 
-def fit_batched_traced(trueX, p, n_iter, batch_size=300, monitor=None, eval_every=1):
+# ============================================================
+# WARMUP
+# ============================================================
+
+def warmup(n=8, p=3, n_iter=4, dtype=np.float64):
     """
-    Same as fit_batched but also returns the cumulative sample count
-    at the end of each batch (handy for plotting EVR vs. samples-seen).
+    Run one tiny end-to-end fit to compile every @njit function.
+
+    Call once before timing, mirroring the SVD/EIG pattern in the notebook.
     """
-    trueX = trueX.astype(np.float64, copy=False)
-    n_local, n_total = trueX.shape
+    rng = np.random.default_rng(0)
+    A = rng.standard_normal((n, n)).astype(dtype)
+    S = (A + A.T) / 2.0
 
-    if p > n_local:
-        raise ValueError(f"p must be <= n. Got p={p}, n={n_local}.")
+    U = np.eye(n, dtype=dtype)
+    _init_global_buf(n, n, dtype)
 
-    if batch_size < n_local:
-        print(f"Batch size too small! Setting to {n_local}")
-        batch_size = n_local
+    # Run the full path: compute_row_top_candidates_eig, choose_group, block_eig_update
+    fit_group_eig(S, p, n_iter, U)
 
-    total_batches = n_total // batch_size + (1 if n_total % batch_size else 0)
-
-    u = np.identity(n_local, dtype=np.float64)
-    s = np.zeros((n_local, n_local), dtype=np.float64)
-    traces = np.zeros(total_batches, dtype=np.float64)
-    samples_seen_arr = np.zeros(total_batches, dtype=np.int64)
-
-    start_index = 0
-    end_index = min(batch_size, n_total)
-
-    X_batch = trueX[:, start_index:end_index]
-    s = _accumulate_covariance(X_batch)
-    s = 0.5 * (s + s.T)
-
-    last_trace = 0.0
-    used_batches = 0
-
-    for bi in range(total_batches):
-        u, s = fit_group_full_recompute(s, p, n_iter, u)
-
-        if monitor is not None:
-            if bi % eval_every == 0:
-                last_trace = get_evr_on_matrix(
-                    monitor.astype(np.float64, copy=False), u, p
-                )
-            traces[bi] = last_trace
-        else:
-            traces[bi] = tr_p(s, p)
-
-        samples_seen_arr[bi] = end_index
-        used_batches = bi + 1
-
-        if end_index == n_total:
-            break
-
-        start_index += batch_size
-        end_index = min(end_index + batch_size, n_total)
-
-        X_next = trueX[:, start_index:end_index]
-        Y_new = u.T @ X_next
-        Y_top = Y_new[:p, :]
-        Y_bot = Y_new[p:, :]
-
-        s_next = np.empty_like(s)
-        s_next[:p, :p] = s[:p, :p] + Y_top @ Y_top.T
-        s_next[:p, p:] = Y_top @ Y_bot.T
-        s_next[p:, :p] = s_next[:p, p:].T
-        s_next[p:, p:] = Y_bot @ Y_bot.T
-
-        s = 0.5 * (s_next + s_next.T)
-
-    return traces[:used_batches], samples_seen_arr[:used_batches], u
+    return None

@@ -3,23 +3,6 @@ from scipy.linalg.blas import get_blas_funcs
 
 
 def partial_hessenberg_householder_inplace(X, p, u=None):
-    """
-    Partial QR via Householder reflections on the first p columns of X.
-
-    Mutates X in place so that X[k+1:, k] == 0 for k = 0..p-1.
-    If u is provided, mutates it in place as u <- u @ Q so that
-    (u_new) @ (X_new) == (u_old) @ (X_old).
-
-    Parameters
-    ----------
-    X : (d, n) float64 array, modified in place.
-    p : int, number of columns to triangularize.
-    u : (d, d) float64 array or None. If given, accumulated into.
-
-    Returns
-    -------
-    X, u  (both possibly mutated)
-    """
     n, N = X.shape
     dtype = X.dtype
 
@@ -40,7 +23,6 @@ def partial_hessenberg_householder_inplace(X, p, u=None):
         v = x
         tau = 2.0 / np.vdot(v, v)
 
-        # Apply to trailing columns of X from the left
         if k + 1 < N:
             X_trail = X[k:, k + 1:]
             m = N - k - 1
@@ -49,7 +31,6 @@ def partial_hessenberg_householder_inplace(X, p, u=None):
             w *= tau
             X_trail -= np.multiply.outer(v, w)
 
-        # Accumulate into u: u <- u @ H_k, where H_k acts on rows k:
         if u is not None:
             U_block = u[:, k:]
             z = wU
@@ -64,21 +45,6 @@ def partial_hessenberg_householder_inplace(X, p, u=None):
 
 
 def partial_symmetric_householder_inplace(S, p, Q=None):
-    """
-    Partial symmetric tridiagonalization of S = S.T via two-sided
-    Householder reflections. Mutates S in place; if Q is given, mutates
-    it as Q <- Q @ H so that Q_new @ S_new @ Q_new.T == Q_old @ S_old @ Q_old.T.
-
-    Parameters
-    ----------
-    S : (d, d) symmetric float64 array, Fortran-ordered, modified in place.
-    p : int, number of columns to tridiagonalize.
-    Q : (d, d) float64 array or None.
-
-    Returns
-    -------
-    S, Q
-    """
     n = S.shape[0]
     ger = get_blas_funcs("ger", arrays=(S,))
 
@@ -137,29 +103,40 @@ def partial_symmetric_householder_inplace(S, p, Q=None):
 
 
 def hessenberg_warmstart(x_batch, u, p):
-    """
-    Apply partial Hessenberg preprocessing to a streaming batch.
-
-    Mutates x_batch and u in place. After this call, x_batch[k+1:, k] == 0
-    for k = 0..p-1, and u @ x_batch (new) == u @ x_batch (old).
-    """
     partial_hessenberg_householder_inplace(x_batch, p, u)
     return x_batch, u
 
 
 def symmetric_warmstart(x_batch, u, p):
-    """
-    Apply partial symmetric tridiagonalization preprocessing to a streaming
-    batch via S = x_batch @ x_batch.T.
-
-    Mutates x_batch and u in place: x_batch <- Q.T @ x_batch, u <- u @ Q,
-    where Q comes from partial-tridiagonalizing S.
-    """
     d = x_batch.shape[0]
     S = np.asfortranarray(x_batch @ x_batch.T)
     Q = np.eye(d, dtype=x_batch.dtype, order="F")
     partial_symmetric_householder_inplace(S, p, Q)
-    # Apply Q to x and u
     x_batch[:] = Q.T @ x_batch
     u[:] = u @ Q
     return x_batch, u
+
+
+def symmetric_warmstart_eig(S, u, p):
+    """
+    EIG-flavor warmstart: partially tridiagonalize S (n x n symmetric) in place
+    via Householder, accumulate the rotation Q into u (u <- u @ Q), and apply
+    Q^T S Q similarity transform in place.
+
+    The EIG-side analog of `symmetric_warmstart`. Differs in that the input
+    is already the symmetric matrix S (no x_batch @ x_batch.T step), so this
+    is strictly cheaper.
+
+    Mutates S and u in place. Returns (S, u).
+    """
+    n = S.shape[0]
+    if not S.flags["F_CONTIGUOUS"]:
+        S_F = np.asfortranarray(S)
+    else:
+        S_F = S
+    Q = np.eye(n, dtype=S.dtype, order="F")
+    partial_symmetric_householder_inplace(S_F, p, Q)
+    if S_F is not S:
+        S[:] = S_F
+    u[:] = u @ Q
+    return S, u
