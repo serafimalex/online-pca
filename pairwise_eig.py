@@ -1,52 +1,25 @@
-"""
-online_eig_buffer.py
-
-Streaming Jacobi-style EIG decomposition with greedy pivot selection.
-
-This is the symmetric analog of the SVD algorithm in online_svd_buffer.py.
-The key differences:
-  - The working matrix is S (n x n, symmetric), not X (n x N, rectangular)
-  - Each iteration applies ONE rotation G, not two (G and H)
-  - Update is a similarity transform: S = G^T S G
-  - State size is bounded: only (S, U), both n x n, regardless of stream length
-  - Score formula is unified: C_ij = lambda_max(S_2x2) - S_ii
-
-Streaming model:
-  Maintain running (S, U). When new samples X_new (n x m) arrive:
-    1. Project: Y = U^T @ X_new                (Y is n x m)
-    2. Update : S += Y @ Y^T                   (rank-m symmetric update)
-    3. Run k Jacobi iterations on S, accumulating G rotations into U.
-
-API mirrors online_svd_buffer.py for drop-in use in the benchmark notebook.
-"""
-
 import numpy as np
 from numba import njit, prange, set_num_threads as _set_num_threads
 
 
 # ============================================================
-# MODULE-LEVEL CONSTANTS (mirror online_svd_buffer.py names)
+# MODULE-LEVEL CONSTANTS
 # ============================================================
 
-TEMP_COL = None         # scratch column buffer, sized n
-TEMP_ROW = None         # scratch row buffer, sized n  (S is square so same size)
+TEMP_COL = None         
+TEMP_ROW = None         
 TOP_K_SCORES = 5
 NEG_INF32 = np.float64(-1e30)
 NUMBA_THREADS = 1
 
 
 def set_num_threads(k):
-    """Set the number of threads numba uses for parallel loops."""
     global NUMBA_THREADS
     NUMBA_THREADS = k
     _set_num_threads(k)
 
 
 def _init_global_buf(n_rows, n_cols, dtype):
-    """
-    Allocate scratch buffers. For EIG, n_rows == n_cols == n typically.
-    Kept with the same signature as the SVD version for compatibility.
-    """
     global TEMP_COL, TEMP_ROW
     TEMP_COL = np.zeros(n_rows, dtype=dtype)
     TEMP_ROW = np.zeros(n_cols, dtype=dtype)
@@ -62,26 +35,9 @@ def _init_global_buf(n_rows, n_cols, dtype):
 
 @njit(parallel=True)
 def compute_and_assign_topk_eig(p, S, scores, row_topk_vals, row_topk_idx):
-    """
-    Initialize the full score grid and per-row top-k caches.
-
-    Parameters
-    ----------
-    p : int
-        Number of kept eigen-directions.
-    S : (n, n) float64
-        Current (symmetric) working matrix.
-    scores : (p, n) float64
-        Score grid, will be overwritten for i<j entries.
-    row_topk_vals : (p, TOP_K_SCORES) float64
-        Per-row best score values, will be filled in sorted-desc order.
-    row_topk_idx : (p, TOP_K_SCORES) int64
-        Column indices corresponding to row_topk_vals.
-    """
     n = S.shape[0]
 
     for i in prange(p):
-        # reset this row's topk
         for k in range(TOP_K_SCORES):
             row_topk_vals[i, k] = NEG_INF32
             row_topk_idx[i, k] = -1
@@ -99,7 +55,6 @@ def compute_and_assign_topk_eig(p, S, scores, row_topk_vals, row_topk_idx):
             val = lmax - sii
             scores[i, j] = val
 
-            # insertion into top-k
             if val > row_topk_vals[i, TOP_K_SCORES - 1]:
                 k = TOP_K_SCORES - 1
                 while k > 0 and val > row_topk_vals[i, k - 1]:
@@ -112,19 +67,18 @@ def compute_and_assign_topk_eig(p, S, scores, row_topk_vals, row_topk_idx):
 
 @njit
 def _score_one(i, j, S):
-    """Return the eigen-pivot score lambda_max(S_2x2_ij) - S_ii."""
     sii = S[i, i]
     sjj = S[j, j]
     sij = S[i, j]
     half_sum = 0.5 * (sii + sjj)
     half_dif = 0.5 * (sii - sjj)
     radius = np.sqrt(half_dif * half_dif + sij * sij)
+    
     return half_sum + radius - sii
 
 
 @njit
 def recompute_row_topk(scores, topk_vals, topk_idxs, r):
-    """Rebuild topk for row r from scratch by scanning scores[r, :]."""
     row_sz = scores.shape[1]
 
     top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float64)
@@ -148,7 +102,6 @@ def recompute_row_topk(scores, topk_vals, topk_idxs, r):
 
 @njit
 def get_max_topk(row_topk_vals, row_topk_idx):
-    """Return (i_q, j_q) = global argmax over rows' best scores."""
     max_val = -np.inf
     max_r = -1
     for r in range(row_topk_vals.shape[0]):
@@ -165,9 +118,6 @@ def get_max_topk(row_topk_vals, row_topk_idx):
 # ============================================================
 # AFFECTED-SCORE REFRESH
 # ============================================================
-# After applying a Givens rotation at (iq, jq), rows/cols iq and jq of S have
-# changed. So any score C[r, c] involving r in {iq, jq} or c in {iq, jq} is
-# stale. We refresh those four strips.
 
 @njit(parallel=True)
 def refresh_row_topk(scores, r, S, p, row_topk_vals, row_topk_idx):
