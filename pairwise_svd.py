@@ -57,18 +57,7 @@ def compute_and_assign_topk_cf(p, x, scores, row_topk_vals, row_topk_idx):
 
     for i in prange(p):
         for j in range(i + 1, n):
-            xji = x[j, i] if j < d else 0.0
-            xjj = x[j, j] if j < d else 0.0
-
-            xii = x[i, i]
-            xij = x[i, j]
-
-            if xii * xjj - xij * xji >= 0:
-                diff = xij - xji
-                val = np.sqrt((xii + xjj)**2 + diff**2) - xii - xjj
-            else:
-                diff = xij + xji
-                val = np.sqrt((xii - xjj)**2 + diff**2) - xii - xjj
+            val = _score(i, j, x, d, p)
 
             scores[i, j] = val
 
@@ -120,6 +109,30 @@ def compute_score_nf_numba(i, j, x, d):
     lambda2 = (t - np.sqrt(discriminant)) / 2.0
     
     return i, j, np.sqrt(max(lambda1, lambda2)) - a
+
+
+@njit
+def _score(i, j, x, d, p):
+    a = x[i, i]
+    b = x[i, j]
+    c = x[j, i] if j < d else 0.0
+    z = x[j, j] if j < d else 0.0
+
+    if j < p:
+        if a * z - b * c >= 0.0:
+            diff = b - c
+            return np.sqrt((a + z) ** 2 + diff * diff) - a - z
+        else:
+            diff = b + c
+            return np.sqrt((a - z) ** 2 + diff * diff) - a - z
+    else:
+        t = a * a + b * b + c * c + z * z
+        d1 = a * z - b * c
+        disc = t * t - 4.0 * d1 * d1
+        if disc < 0.0:
+            disc = 0.0
+        lmax = 0.5 * (t + np.sqrt(disc))
+        return np.sqrt(lmax) - a
 
 def rightMatmul_fast(x, i, j, m):
     n_rows, n_cols = x.shape
@@ -240,12 +253,12 @@ def get_new_vals_numba(scores, iq, x, d, row_max_vals, row_max_idx):
             row_max_idx[iq] = s
 
 @njit(parallel=True)
-def get_new_topk_numba(scores, iq, x, d, row_topk_vals, row_topk_idx):
+def get_new_topk_numba(scores, iq, x, d, p, row_topk_vals, row_topk_idx):
     top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float64)
     top_idxs = np.full(TOP_K_SCORES, -1, dtype=np.int32)
 
     for s in prange(iq + 1, d):
-        val = compute_score_nf_numba(iq, s, x, d)[2]
+        val = _score(iq, s, x, d, p)
         scores[iq, s] = val
 
         if val > top_vals[TOP_K_SCORES - 1]:
@@ -273,12 +286,12 @@ def get_new_vals_numba2(scores, jq, x, d, n, row_max_vals, row_max_idx):
 
 
 @njit(parallel=True)
-def get_new_topk_numba2(scores, jq, x, d, n, row_topk_vals, row_topk_idx):
+def get_new_topk_numba2(scores, jq, x, d, n, p, row_topk_vals, row_topk_idx):
     top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float64)
     top_idxs = np.full(TOP_K_SCORES, -1, dtype=np.int32)
 
     for s in prange(jq + 1, n):
-        val = compute_score_nf_numba(jq, s, x, d)[2]
+        val = _score(jq, s, x, d, p)
         scores[jq, s] = val
 
         if val > top_vals[TOP_K_SCORES - 1]:
@@ -308,10 +321,10 @@ def get_new_vals_col_numba(scores, iq, x, d, row_max_vals, row_max_idx):
 
 
 @njit(parallel=True)
-def get_new_topk_col_numba(scores, iq, x, d,
+def get_new_topk_col_numba(scores, iq, x, d, p,
                            row_topk_vals, row_topk_idx):
     for r in prange(iq):
-        val = compute_score_nf_numba(r, iq, x, d)[2]
+        val = _score(r, iq, x, d, p)
         scores[r, iq] = val
 
         existing_pos = -1
@@ -357,7 +370,7 @@ def get_new_topk_col_numba2(scores, jq, x, d, p,
                             row_topk_vals, row_topk_idx):
     min_val = min(jq, p)
     for r in prange(min_val):
-        val = compute_score_nf_numba(r, jq, x, d)[2]
+        val = _score(r, jq, x, d, p)
         scores[r, jq] = val
 
         existing_pos = -1
@@ -399,13 +412,11 @@ def get_max_topk(row_topk_vals, row_topk_idx):
             max_val = row_topk_vals[r, 0]
             max_r = r
 
-    # If no valid value, return -1
     if max_r == -1:
         return -1, -1
 
     return max_r, row_topk_idx[max_r, 0]
                             
-# @njit()
 def mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_idx, TEMP_COL):
     rightMatmulTranspose_fast(x, iq, jq, H)
     rightMatmul_fast(u, iq, jq, G)
@@ -413,23 +424,20 @@ def mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_
     if jq < d:
         leftMatmulTranspose_fast(x, iq, jq, G) 
 
-    get_new_topk_numba(scores, iq, x, d, row_max_vals, row_max_idx) 
+    get_new_topk_numba(scores, iq, x, d, p, row_max_vals, row_max_idx)
 
-    if jq < p:   
-        get_new_topk_numba2(scores, jq, x, d, n, row_max_vals, row_max_idx)   
+    if jq < p:
+        get_new_topk_numba2(scores, jq, x, d, n, p, row_max_vals, row_max_idx)
 
-    get_new_topk_col_numba(scores, iq, x, d, row_max_vals, row_max_idx) 
+    get_new_topk_col_numba(scores, iq, x, d, p, row_max_vals, row_max_idx)
     get_new_topk_col_numba2(scores, jq, x, d, p, row_max_vals, row_max_idx)
 
  
-# @njit
 def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i, TEMP_COL):
     d = x.shape[0]
     n = x.shape[1]
-    # compute_and_assign_numba_cf(p, x, scores, row_max_vals, row_max_idx)
     compute_and_assign_topk_cf(p, x, scores, row_max_vals, row_max_idx)
     for q in range(n_iter):
-        # iq, jq = get_max(row_max_vals, row_max_idx)
         iq, jq = get_max_topk(row_max_vals, row_max_idx)
         if jq >= d:
             xji = 0
@@ -443,7 +451,6 @@ def fit(x, p, n_iter, u,scores, row_max_vals, row_max_idx, traces, batch_i, TEMP
         t[1, 0] = xji
         t[1, 1] = xjj
         G, _, H = np.linalg.svd(t)
-        # update intermediate x and u
         mul_update_numba(x, iq, jq, H, G, u, d, n, p, scores, row_max_vals, row_max_idx, TEMP_COL)
 
     return u, x
@@ -497,7 +504,7 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
     i = 0
     u, x = fit(x_batch, p, n_iter, u, scores, row_max_vals, row_max_idx, traces, i, TEMP_COL)
    
-    traces[i] = 0 #get_evr(trueX, u, p)
+    traces[i] = 0
     print(f"Done batch {i}")
     while True:
         i += 1
@@ -517,7 +524,7 @@ def fit_batched(trueX, p, n_iter, batch_size=300):
         row_max_idx.fill(-1)
 
         u, x = fit(x_batch, p, n_iter, u, scores, row_max_vals, row_max_idx, traces, i, TEMP_COL)
-        traces[i] = 0 #get_evr(trueX, u, p)
+        traces[i] = 0
         print(f"Done batch {i}")
 
     return traces, u, x

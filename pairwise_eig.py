@@ -206,13 +206,11 @@ def jacobi_2x2_rotation(sii, sjj, sij):
     """
     Compute the 2x2 Jacobi rotation G such that
         G^T [[sii, sij], [sij, sjj]] G = diag(lambda_max, lambda_min)
-
-    Returns the 2x2 matrix G = [[c, -s], [s, c]] where c = cos(theta),
-    s = sin(theta).  Convention: lambda_max ends up at (0,0).
+    with lambda_max at (0,0). Returns the 2x2 matrix G.
     """
     G = np.zeros((2, 2), dtype=np.float64)
     if sij == 0.0:
-        # already diagonal: just identity (or swap if needed)
+        # already diagonal: identity, or swap if needed so larger is at (0,0)
         if sjj > sii:
             G[0, 0] = 0.0
             G[0, 1] = -1.0
@@ -230,10 +228,8 @@ def jacobi_2x2_rotation(sii, sjj, sij):
         c = 1.0 / np.sqrt(2.0)
         s = t * c
     else:
-        # numerically stable form
         tau = diff / (2.0 * sij)
         # Guard against tau-squared overflow when |sij| is tiny.
-        # When |tau| is very large, t ~= 1/(2 tau), and the rotation is nearly identity.
         abs_tau = abs(tau)
         if abs_tau > 1e8:
             t = 0.5 / tau
@@ -245,22 +241,21 @@ def jacobi_2x2_rotation(sii, sjj, sij):
         c = 1.0 / np.sqrt(1.0 + t * t)
         s = t * c
 
-    # Decide orientation so the larger eigenvalue lands at (0,0).
-    # Eigenvalue at (0,0) after rotation = sii + t * sij (using t = s/c).
-    # If that's smaller than sjj - t*sij, swap by composing with a 90deg flip.
-    lam_first = sii + t * sij
-    lam_second = sjj - t * sij
-    if lam_first >= lam_second:
+    # Orientation: place the LARGER eigenvalue at (0,0). Decide from the actual
+    # post-rotation diagonal entries for G = [[c, -s], [s, c]], not a proxy.
+    new_ii = c * c * sii + 2.0 * c * s * sij + s * s * sjj
+    new_jj = s * s * sii - 2.0 * c * s * sij + c * c * sjj
+    if new_ii >= new_jj:
         G[0, 0] = c
         G[0, 1] = -s
         G[1, 0] = s
         G[1, 1] = c
     else:
-        # swap eigenvectors so largest is first
-        G[0, 0] = s
+        # swap eigenvectors (column swap) so the larger eigenvalue lands at (0,0)
+        G[0, 0] = -s
         G[0, 1] = c
         G[1, 0] = c
-        G[1, 1] = -s
+        G[1, 1] = s
     return G
 
 
