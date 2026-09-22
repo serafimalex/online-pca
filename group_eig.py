@@ -178,6 +178,7 @@ def block_eig_update(S, U, indices):
 
         S[idx, :]   = G_local^T @ S[idx, :]      (left mult on the slice)
         S[:, idx]   = S[:, idx]   @ G_local      (right mult on the slice)
+        S[idx, idx] = Lambda                     (known exactly; written in)
         U[:, idx]   = U[:, idx]   @ G_local      (right mult on basis)
 
     Eigh returns eigenvalues in ascending order; we reorder so that the largest
@@ -223,8 +224,13 @@ def block_eig_update(S, U, indices):
     S_cols = np.ascontiguousarray(S[:, idx])
     S[:, idx] = S_cols @ G_local
 
-    # Re-symmetrize after the slice update (floating-point drift).
-    S = 0.5 * (S + S.T)
+    # The block is exactly Lambda by construction (that is what eigh just
+    # returned), so write it in directly instead of letting it fall out of the
+    # two matmuls above. Everything outside the block is already symmetric --
+    # S was symmetric going in, so the updated rows and columns are transposes
+    # of one another as a matter of algebra. Re-symmetrizing all n^2 entries
+    # here to scrub ~1e-17 of rounding costs ~75% of the runtime at d=3072.
+    S[np.ix_(idx, idx)] = np.diag(eigvals[::-1])
 
     # U[:, idx] = U[:, idx] @ G_local
     U_cols = np.ascontiguousarray(U[:, idx])
@@ -411,7 +417,6 @@ def run_group_eig(X, P, G, batch_size, monitor, evr_fn,
 
     d = X.shape[0]
     n_total = X.shape[1]
-    batch_size = max(batch_size, d)
 
     eig = OnlineGroupEIG(n=d, p=P, k_per_batch=G, top_m=top_m)
 

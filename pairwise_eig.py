@@ -241,8 +241,8 @@ def jacobi_2x2_rotation(sii, sjj, sij):
         c = 1.0 / np.sqrt(1.0 + t * t)
         s = t * c
 
-    # Orientation: place the LARGER eigenvalue at (0,0). Decide from the actual
-    # post-rotation diagonal entries for G = [[c, -s], [s, c]], not a proxy.
+    # Orientation: place the LARGER eigenvalue at (0,0), computing the actual
+    # post-rotation diagonal entries for G = [[c, -s], [s, c]].
     new_ii = c * c * sii + 2.0 * c * s * sij + s * s * sjj
     new_jj = s * s * sii - 2.0 * c * s * sij + c * c * sjj
     if new_ii >= new_jj:
@@ -524,7 +524,6 @@ def run_online_eig(X, P, G, batch_size, monitor, evr_fn, warmstart=None):
 
     d = X.shape[0]
     n_total = X.shape[1]
-    batch_size = max(batch_size, d)
 
     eig = OnlineEIG(n=d, p=P, k_per_batch=G)
 
