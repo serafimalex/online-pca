@@ -1,0 +1,37 @@
+# Core: needed by pairwise_eig.py, group_eig.py, pairwise_svd.py, group_svd.py,
+# preprocess.py, data.py and the notebooks.
+numpy>=2.0,<2.6
+scipy>=1.11
+scikit-learn>=1.4
+numba>=0.67          # requires numpy<2.6
+pandas>=2.0          # dataset parsing in data.py
+matplotlib>=3.8
+tqdm>=4.66
+joblib>=1.3
+ipykernel>=6.29
+line_profiler        # unused @profile import at the top of pairwise_svd.py
+
+# OjaPCA baseline (tools/oja_pca.py), and the cifar10 / fashion_mnist
+# downloaders in data.py. CPU builds:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
+torchvision>=0.15
+
+# Dataset parsing extra (data.py imports it lazily, only isolet needs it):
+unlzw3               # isolet (.Z / LZW archives)
+
+# PyParSVD baseline. Its package __init__ pulls in the parallel backend even
+# when only ParSVD_Serial is used, so these are required just to import it.
+# impi-rt supplies Intel MPI as a plain wheel - on Windows this avoids needing
+# an admin install of the MS-MPI runtime that mpi4py otherwise looks for.
+mpi4py>=4.0
+impi-rt
+netCDF4
+h5py
+
+# Baselines that are NOT on PyPI - install manually, both are gitignored:
+#   online_psp : git clone https://github.com/flatironinstitute/online_psp
+#                (vendored at ./online_psp; the coord_update Cython kernel is
+#                optional - CCIPCA(cython=False) is pure numpy)
+#   PyParSVD   : git clone https://github.com/Romit-Maulik/PyParSVD
+#                (vendored at ./pyparsvd)
