@@ -1,6 +1,8 @@
 import numpy as np
 from numba import njit, prange, set_num_threads as _set_num_threads
 
+from validation import check_batch, check_init
+
 
 # ============================================================
 # MODULE-LEVEL CONSTANTS
@@ -349,6 +351,10 @@ def fit_safe(S, p, n_iter, u, scores, row_topk_vals, row_topk_idx, TEMP_COL=None
     u, S : the (possibly-modified) basis and working matrix.
     """
     n = S.shape[0]
+    # The score kernels are @njit(parallel=True); numba does not bounds-check
+    # parallel loops, so p > n would read past the end of S undetected.
+    if not 1 <= p <= n:
+        raise ValueError(f"p must satisfy 1 <= p <= n; got p={p}, n={n}")
 
     compute_and_assign_topk_eig(p, S, scores, row_topk_vals, row_topk_idx)
 
@@ -415,11 +421,13 @@ class OnlineEIG:
         self.U  : (n, n) accumulated rotation, columns = approx eigenvectors
     """
 
-    def __init__(self, n, p, k_per_batch=500, dtype=np.float64):
+    def __init__(self, n, p, k_per_batch=500, dtype=np.float64, check_finite=True):
+        n, p, k_per_batch = check_init(n, p, k_per_batch)
         self.n = n
         self.p = p
         self.k_per_batch = k_per_batch
         self.dtype = dtype
+        self.check_finite = check_finite
 
         self.S_ = np.zeros((n, n), dtype=dtype)
         self.U_ = np.eye(n, dtype=dtype)
@@ -448,7 +456,7 @@ class OnlineEIG:
             Applied only on the first batch, after the covariance update but
             before the Jacobi iterations. Typically a partial tridiagonalizer.
         """
-        Xb = np.asarray(X_batch, dtype=self.dtype)
+        Xb = check_batch(X_batch, self.n, self.dtype, self.check_finite)
         # Project new data into U's frame, then accumulate covariance
         Y = self.U_.T @ Xb                 # (n, m)
         # In-frame rank-m symmetric update: S += Y Y^T

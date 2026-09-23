@@ -38,6 +38,8 @@ Drop-in for the benchmark notebook:
 
 import numpy as np
 
+from validation import check_batch, check_init
+
 try:
     from numba import njit, prange, set_num_threads as _set_num_threads
     NUMBA_AVAILABLE = True
@@ -323,12 +325,15 @@ class OnlineGroupEIG:
         self.U_ : (n, n) accumulated rotation; first p columns = approx top-p basis
     """
 
-    def __init__(self, n, p, k_per_batch=33, top_m=TOP_CANDIDATES_PER_ROW, dtype=np.float64):
+    def __init__(self, n, p, k_per_batch=33, top_m=TOP_CANDIDATES_PER_ROW,
+                 dtype=np.float64, check_finite=True):
+        n, p, k_per_batch = check_init(n, p, k_per_batch)
         self.n = n
         self.p = p
         self.k_per_batch = k_per_batch
         self.top_m = top_m
         self.dtype = dtype
+        self.check_finite = check_finite
 
         self.S_ = np.zeros((n, n), dtype=dtype)
         self.U_ = np.eye(n, dtype=dtype)
@@ -349,7 +354,7 @@ class OnlineGroupEIG:
             Applied only on the first batch, after covariance accumulation
             but before the group iterations.
         """
-        Xb = np.asarray(X_batch, dtype=self.dtype)
+        Xb = check_batch(X_batch, self.n, self.dtype, self.check_finite)
         # Project into U's frame
         Y = self.U_.T @ Xb               # (n, m)
         # Rank-m symmetric update
