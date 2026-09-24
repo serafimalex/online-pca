@@ -1,5 +1,4 @@
 import numpy as np
-from numba import njit, prange, set_num_threads as _set_num_threads
 
 from validation import check_batch, check_init
 
@@ -8,23 +7,7 @@ from validation import check_batch, check_init
 # MODULE-LEVEL CONSTANTS
 # ============================================================
 
-TEMP_COL = None         
-TEMP_ROW = None         
-TOP_K_SCORES = 5
-NEG_INF32 = np.float64(-1e30)
-NUMBA_THREADS = 1
-
-
-def set_num_threads(k):
-    global NUMBA_THREADS
-    NUMBA_THREADS = k
-    _set_num_threads(k)
-
-
-def _init_global_buf(n_rows, n_cols, dtype):
-    global TEMP_COL, TEMP_ROW
-    TEMP_COL = np.zeros(n_rows, dtype=dtype)
-    TEMP_ROW = np.zeros(n_cols, dtype=dtype)
+NEG_INF = np.float64(-1e30)
 
 
 # ============================================================
@@ -35,175 +18,42 @@ def _init_global_buf(n_rows, n_cols, dtype):
 #   lambda_max,min = (S_ii + S_jj) / 2  +/-  sqrt( ((S_ii - S_jj)/2)^2 + S_ij^2 )
 # The score is lambda_max - S_ii.
 
-@njit(parallel=True)
-def compute_and_assign_topk_eig(p, S, scores, row_topk_vals, row_topk_idx):
-    n = S.shape[0]
-
-    for i in prange(p):
-        for k in range(TOP_K_SCORES):
-            row_topk_vals[i, k] = NEG_INF32
-            row_topk_idx[i, k] = -1
-
-        sii = S[i, i]
-        for j in range(i + 1, n):
-            sjj = S[j, j]
-            sij = S[i, j]
-
-            half_sum = 0.5 * (sii + sjj)
-            half_dif = 0.5 * (sii - sjj)
-            radius = np.sqrt(half_dif * half_dif + sij * sij)
-            lmax = half_sum + radius
-
-            val = lmax - sii
-            scores[i, j] = val
-
-            if val > row_topk_vals[i, TOP_K_SCORES - 1]:
-                k = TOP_K_SCORES - 1
-                while k > 0 and val > row_topk_vals[i, k - 1]:
-                    row_topk_vals[i, k] = row_topk_vals[i, k - 1]
-                    row_topk_idx[i, k] = row_topk_idx[i, k - 1]
-                    k -= 1
-                row_topk_vals[i, k] = val
-                row_topk_idx[i, k] = j
-
-
-@njit
-def _score_one(i, j, S):
-    sii = S[i, i]
-    sjj = S[j, j]
-    sij = S[i, j]
-    half_sum = 0.5 * (sii + sjj)
-    half_dif = 0.5 * (sii - sjj)
-    radius = np.sqrt(half_dif * half_dif + sij * sij)
-    
-    return half_sum + radius - sii
-
-
-@njit
-def recompute_row_topk(scores, topk_vals, topk_idxs, r):
-    row_sz = scores.shape[1]
-
-    top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float64)
-    top_idxs = np.full(TOP_K_SCORES, -1, dtype=np.int64)
-
-    for j in range(row_sz):
-        v = scores[r, j]
-        if v > top_vals[TOP_K_SCORES - 1]:
-            k = TOP_K_SCORES - 1
-            while k > 0 and v > top_vals[k - 1]:
-                top_vals[k] = top_vals[k - 1]
-                top_idxs[k] = top_idxs[k - 1]
-                k -= 1
-            top_vals[k] = v
-            top_idxs[k] = j
-
-    for k in range(TOP_K_SCORES):
-        topk_vals[r, k] = top_vals[k]
-        topk_idxs[r, k] = top_idxs[k]
-
-
-@njit
-def get_max_topk(row_topk_vals, row_topk_idx):
-    max_val = -np.inf
-    max_r = -1
-    for r in range(row_topk_vals.shape[0]):
-        if row_topk_vals[r, 0] > max_val:
-            max_val = row_topk_vals[r, 0]
-            max_r = r
-
-    if max_r == -1:
-        return -1, -1
-
-    return max_r, int(row_topk_idx[max_r, 0])
-
-
-# ============================================================
-# AFFECTED-SCORE REFRESH
-# ============================================================
-
-@njit(parallel=True)
-def refresh_row_topk(scores, r, S, p, row_topk_vals, row_topk_idx):
+def score_grid(S, p, diag):
     """
-    Recompute scores[r, r+1 .. n-1] for row r (must have r < p), rebuild topk.
+    Full (p, n) score grid C_ij, with j <= i masked to NEG_INF.
+
+    Vectorized over both axes: this is the whole scan the pivot search needs.
     """
     n = S.shape[0]
-
-    # reset
-    top_vals = np.full(TOP_K_SCORES, NEG_INF32, dtype=np.float64)
-    top_idxs = np.full(TOP_K_SCORES, -1, dtype=np.int64)
-
-    for s in prange(r + 1, n):
-        val = _score_one(r, s, S)
-        scores[r, s] = val
-        # NB: prange + shared top arrays — but each iteration only reads/writes
-        # via the merge below, which we do serially after the loop.
-
-    # serial merge to top-k (small, n iterations)
-    for s in range(r + 1, n):
-        val = scores[r, s]
-        if val > top_vals[TOP_K_SCORES - 1]:
-            k = TOP_K_SCORES - 1
-            while k > 0 and val > top_vals[k - 1]:
-                top_vals[k] = top_vals[k - 1]
-                top_idxs[k] = top_idxs[k - 1]
-                k -= 1
-            top_vals[k] = val
-            top_idxs[k] = s
-
-    for k in range(TOP_K_SCORES):
-        row_topk_vals[r, k] = top_vals[k]
-        row_topk_idx[r, k] = top_idxs[k]
+    di = diag[:p, None]
+    dj = diag[None, :]
+    half_dif = 0.5 * (di - dj)
+    radius = np.sqrt(half_dif * half_dif + S[:p, :] ** 2)
+    vals = 0.5 * (di + dj) + radius - di
+    vals[np.arange(n)[None, :] <= np.arange(p)[:, None]] = NEG_INF
+    return vals
 
 
-@njit(parallel=True)
-def refresh_col_topk(scores, c, S, p, row_topk_vals, row_topk_idx):
-    """
-    Recompute scores[r, c] for r < min(c, p) and update those rows' topk.
+def row_scores(S, r, diag):
+    """Scores C_rs for s > r (entries s <= r masked). Shape (n,)."""
+    dr = diag[r]
+    half_dif = 0.5 * (dr - diag)
+    vals = 0.5 * (dr + diag) + np.sqrt(half_dif * half_dif + S[r, :] ** 2) - dr
+    vals[:r + 1] = NEG_INF
+    return vals
 
-    When a column changes, every row r < c that had c as a candidate must be
-    updated. We surgically update scores[r, c]; if c was in row r's top-k, we
-    evict it and re-insert (possibly demoting). If c isn't in top-k, we just
-    try to insert.
-    """
-    limit = min(c, p)
 
-    for r in prange(limit):
-        val = _score_one(r, c, S)
-        scores[r, c] = val
-
-        # remove existing occurrence of c from row r's topk
-        existing = -1
-        for k in range(TOP_K_SCORES):
-            if row_topk_idx[r, k] == c:
-                existing = k
-                break
-        if existing != -1:
-            for k in range(existing, TOP_K_SCORES - 1):
-                row_topk_vals[r, k] = row_topk_vals[r, k + 1]
-                row_topk_idx[r, k] = row_topk_idx[r, k + 1]
-            row_topk_vals[r, TOP_K_SCORES - 1] = NEG_INF32
-            row_topk_idx[r, TOP_K_SCORES - 1] = -1
-
-        # insert new val for column c
-        if val > row_topk_vals[r, TOP_K_SCORES - 1]:
-            k = TOP_K_SCORES - 1
-            while k > 0 and val > row_topk_vals[r, k - 1]:
-                row_topk_vals[r, k] = row_topk_vals[r, k - 1]
-                row_topk_idx[r, k] = row_topk_idx[r, k - 1]
-                k -= 1
-            row_topk_vals[r, k] = val
-            row_topk_idx[r, k] = c
-
-        # if topk has been emptied (slot 0 invalid), rebuild from scratch
-        if row_topk_idx[r, 0] == -1:
-            recompute_row_topk(scores, row_topk_vals, row_topk_idx, r)
+def col_scores(S, c, diag, limit):
+    """Scores C_rc for r < limit. Shape (limit,)."""
+    dr = diag[:limit]
+    half_dif = 0.5 * (dr - diag[c])
+    return 0.5 * (dr + diag[c]) + np.sqrt(half_dif * half_dif + S[:limit, c] ** 2) - dr
 
 
 # ============================================================
 # 2x2 EIGENDECOMPOSITION + ROTATION APPLICATION
 # ============================================================
 
-@njit
 def jacobi_2x2_rotation(sii, sjj, sij):
     """
     Compute the 2x2 Jacobi rotation G such that
@@ -232,14 +82,12 @@ def jacobi_2x2_rotation(sii, sjj, sij):
     else:
         tau = diff / (2.0 * sij)
         # Guard against tau-squared overflow when |sij| is tiny.
-        abs_tau = abs(tau)
-        if abs_tau > 1e8:
+        if abs(tau) > 1e8:
             t = 0.5 / tau
+        elif tau >= 0.0:
+            t = 1.0 / (tau + np.sqrt(1.0 + tau * tau))
         else:
-            if tau >= 0.0:
-                t = 1.0 / (tau + np.sqrt(1.0 + tau * tau))
-            else:
-                t = 1.0 / (tau - np.sqrt(1.0 + tau * tau))
+            t = 1.0 / (tau - np.sqrt(1.0 + tau * tau))
         c = 1.0 / np.sqrt(1.0 + t * t)
         s = t * c
 
@@ -261,75 +109,53 @@ def jacobi_2x2_rotation(sii, sjj, sij):
     return G
 
 
-@njit
 def apply_similarity(S, i, j, G):
     """
     In-place similarity transform S <- G^T S G acting only on rows/cols i, j.
 
-    G is 2x2 with rows indexed (i, j). This touches:
-      - rows i and j  (left mult by G^T)
-      - cols i and j  (right mult by G)
-    cost: O(n)
+    G is 2x2 with rows indexed (i, j). This touches rows i and j (left mult by
+    G^T) and cols i and j (right mult by G).  cost: O(n)
     """
-    n = S.shape[0]
-    c = G[0, 0]
-    s = G[1, 0]
-    # G = [[c, -s], [s, c]]  =>  G^T = [[c, s], [-s, c]]
-    # (we hard-code the swap case via G coefficients passed in)
-    g00 = G[0, 0]
-    g01 = G[0, 1]
-    g10 = G[1, 0]
-    g11 = G[1, 1]
+    g00, g01, g10, g11 = G[0, 0], G[0, 1], G[1, 0], G[1, 1]
 
     # --- Left multiply: S' = G^T S, affects rows i and j only ---
-    # new_row_i = g00 * row_i + g10 * row_j
-    # new_row_j = g01 * row_i + g11 * row_j
-    for col in range(n):
-        a = S[i, col]
-        b = S[j, col]
-        S[i, col] = g00 * a + g10 * b
-        S[j, col] = g01 * a + g11 * b
+    row_i = S[i, :].copy()
+    row_j = S[j, :].copy()
+    S[i, :] = g00 * row_i + g10 * row_j
+    S[j, :] = g01 * row_i + g11 * row_j
 
     # --- Right multiply: S'' = (G^T S) G, affects cols i and j only ---
-    # new_col_i = g00 * col_i + g10 * col_j
-    # new_col_j = g01 * col_i + g11 * col_j
-    for row in range(n):
-        a = S[row, i]
-        b = S[row, j]
-        S[row, i] = g00 * a + g10 * b
-        S[row, j] = g01 * a + g11 * b
+    col_i = S[:, i].copy()
+    col_j = S[:, j].copy()
+    S[:, i] = g00 * col_i + g10 * col_j
+    S[:, j] = g01 * col_i + g11 * col_j
 
-    # Force the off-diagonals (i,j) and (j,i) to exact zero — cleaner than
+    # Force the off-diagonals (i,j) and (j,i) to exact zero - cleaner than
     # relying on floating-point cancellation, and keeps the score grid honest.
     S[i, j] = 0.0
     S[j, i] = 0.0
 
 
-@njit
 def apply_right_to_U(U, i, j, G):
-    """
-    In-place U <- U G, only affects columns i, j of U.  Cost: O(n).
-    """
-    n_rows = U.shape[0]
-    g00 = G[0, 0]
-    g01 = G[0, 1]
-    g10 = G[1, 0]
-    g11 = G[1, 1]
-
-    for row in range(n_rows):
-        a = U[row, i]
-        b = U[row, j]
-        U[row, i] = g00 * a + g10 * b
-        U[row, j] = g01 * a + g11 * b
+    """In-place U <- U G, only affects columns i, j of U.  Cost: O(n)."""
+    g00, g01, g10, g11 = G[0, 0], G[0, 1], G[1, 0], G[1, 1]
+    col_i = U[:, i].copy()
+    col_j = U[:, j].copy()
+    U[:, i] = g00 * col_i + g10 * col_j
+    U[:, j] = g01 * col_i + g11 * col_j
 
 
 # ============================================================
 # CORE FIT LOOP
 # ============================================================
 
-def fit_safe(S, p, n_iter, u, scores, row_topk_vals, row_topk_idx, TEMP_COL=None):
+def fit_safe(S, p, n_iter, u):
     """
-    Drop-in analog of online_svd_buffer.fit_safe, for the EIG algorithm.
+    Run up to n_iter Jacobi rotations on S, accumulating them into u.
+
+    Pivot selection is the argmax over the full (p, n) score grid, as in
+    Algorithm 1. Only the rows and columns a rotation actually invalidates are
+    recomputed afterwards: rows i_q and j_q, columns i_q and j_q.
 
     Parameters
     ----------
@@ -341,63 +167,41 @@ def fit_safe(S, p, n_iter, u, scores, row_topk_vals, row_topk_idx, TEMP_COL=None
         Maximum number of Jacobi rotations to apply this call.
     u : (n, n) float64
         Running basis; modified in place.
-    scores : (p, n) float64
-        Score grid scratch, modified in place.
-    row_topk_vals, row_topk_idx : per-row top-k caches.
-    TEMP_COL : unused, kept for signature compatibility with the SVD class.
 
     Returns
     -------
     u, S : the (possibly-modified) basis and working matrix.
     """
     n = S.shape[0]
-    # The score kernels are @njit(parallel=True); numba does not bounds-check
-    # parallel loops, so p > n would read past the end of S undetected.
     if not 1 <= p <= n:
         raise ValueError(f"p must satisfy 1 <= p <= n; got p={p}, n={n}")
 
-    compute_and_assign_topk_eig(p, S, scores, row_topk_vals, row_topk_idx)
+    diag = np.diag(S).copy()
+    scores = score_grid(S, p, diag)
 
     for _ in range(n_iter):
-        iq, jq = get_max_topk(row_topk_vals, row_topk_idx)
-
-        if iq == -1 or jq == -1:
+        iq, jq = divmod(int(np.argmax(scores)), n)
+        if scores[iq, jq] <= NEG_INF / 2:
             break
 
-        # No j >= n edge case for EIG — S is square, all (i,j) with i<j<=n are valid.
-        # But still guard the SVD-style "stale pivot" case.
-        guard = 0
-        while jq >= n:
-            row_topk_vals[iq, 0] = NEG_INF32
-            row_topk_idx[iq, 0] = -1
-            iq, jq = get_max_topk(row_topk_vals, row_topk_idx)
-            if iq == -1 or jq == -1:
-                return u, S
-            guard += 1
-            if guard > 10000:
-                raise RuntimeError("Too many invalid pivots in EIG fit.")
+        G = jacobi_2x2_rotation(S[iq, iq], S[jq, jq], S[iq, jq])
 
-        # Build 2x2 Jacobi rotation
-        sii = S[iq, iq]
-        sjj = S[jq, jq]
-        sij = S[iq, jq]
-        G = jacobi_2x2_rotation(sii, sjj, sij)
-
-        # Apply similarity transform to S (in place) and right-mult U
         apply_similarity(S, iq, jq, G)
         apply_right_to_U(u, iq, jq, G)
 
-        # Refresh affected scores:
-        #   row iq: scores[iq, s] for s > iq
-        #   row jq: scores[jq, s] for s > jq  (only if jq < p)
-        #   col iq: scores[r, iq] for r < iq
-        #   col jq: scores[r, jq] for r < min(jq, p)
-        if iq < p:
-            refresh_row_topk(scores, iq, S, p, row_topk_vals, row_topk_idx)
-        if jq < p:
-            refresh_row_topk(scores, jq, S, p, row_topk_vals, row_topk_idx)
-        refresh_col_topk(scores, iq, S, p, row_topk_vals, row_topk_idx)
-        refresh_col_topk(scores, jq, S, p, row_topk_vals, row_topk_idx)
+        diag[iq] = S[iq, iq]
+        diag[jq] = S[jq, jq]
+
+        # Refresh only what the rotation invalidated:
+        #   rows iq, jq  (their S_ii changed, so the whole row moves)
+        #   cols iq, jq  (their S_jj changed, for every row above them)
+        for r in (iq, jq):
+            if r < p:
+                scores[r, :] = row_scores(S, r, diag)
+        for c in (iq, jq):
+            limit = min(c, p)
+            if limit > 0:
+                scores[:limit, c] = col_scores(S, c, diag, limit)
 
     return u, S
 
@@ -417,8 +221,8 @@ class OnlineEIG:
         U = eig.U_           # (d, d), first p columns are the top-p basis
 
     State (bounded regardless of stream length):
-        self.S  : (n, n) running second-moment matrix in U's frame
-        self.U  : (n, n) accumulated rotation, columns = approx eigenvectors
+        self.S_ : (n, n) running second-moment matrix in U's frame
+        self.U_ : (n, n) accumulated rotation, columns = approx eigenvectors
     """
 
     def __init__(self, n, p, k_per_batch=500, dtype=np.float64, check_finite=True):
@@ -431,15 +235,6 @@ class OnlineEIG:
 
         self.S_ = np.zeros((n, n), dtype=dtype)
         self.U_ = np.eye(n, dtype=dtype)
-
-        self.scores = np.empty((p, n), dtype=dtype)
-        self.scores.fill(NEG_INF32)
-        self.row_topk_vals = np.empty((p, TOP_K_SCORES), dtype=dtype)
-        self.row_topk_vals.fill(NEG_INF32)
-        self.row_topk_idx = np.empty((p, TOP_K_SCORES), dtype=np.int64)
-        self.row_topk_idx.fill(-1)
-
-        _init_global_buf(n, n, dtype)
 
         self.n_samples_seen_ = 0
         self._first_batch = True
@@ -460,27 +255,20 @@ class OnlineEIG:
         # Project new data into U's frame, then accumulate covariance
         Y = self.U_.T @ Xb                 # (n, m)
         # In-frame rank-m symmetric update: S += Y Y^T
-        # Done with a single gemm rather than an outer-product loop.
         self.S_ += Y @ Y.T
         # Force symmetry (defensive: floating-point drift on big updates).
         self.S_ = 0.5 * (self.S_ + self.S_.T)
 
         # Apply warmstart preconditioning on first batch only.
         # The warmstart should mutate S and U so that U @ S_new @ U^T equals
-        # the original observed covariance — i.e. S <- Q^T S Q, U <- U @ Q.
+        # the original observed covariance - i.e. S <- Q^T S Q, U <- U @ Q.
         if self._first_batch and warmstart is not None:
             warmstart(self.S_, self.U_, self.p)
-            self._first_batch = False
-        elif self._first_batch:
+        if self._first_batch:
             self._first_batch = False
 
         # Run k Jacobi iterations
-        self.U_, self.S_ = fit_safe(
-            self.S_, self.p, self.k_per_batch,
-            self.U_,
-            self.scores, self.row_topk_vals, self.row_topk_idx,
-            TEMP_COL,
-        )
+        self.U_, self.S_ = fit_safe(self.S_, self.p, self.k_per_batch, self.U_)
 
         self.n_samples_seen_ += Xb.shape[1]
         return self
@@ -509,19 +297,19 @@ def run_online_eig(X, P, G, batch_size, monitor, evr_fn, warmstart=None):
 
     Parameters
     ----------
-    X : (d, n_total) float — full stream, columns are samples.
-    P : int — number of components.
-    G : int — Jacobi iterations per batch.
+    X : (d, n_total) float - full stream, columns are samples.
+    P : int - number of components.
+    G : int - Jacobi iterations per batch.
     batch_size : int.
-    monitor : (d, m) — evaluation set.
-    evr_fn : callable(monitor, U, P) -> float — typically `evr_from_U`.
+    monitor : (d, m) - evaluation set.
+    evr_fn : callable(monitor, U, P) -> float - typically `evr_from_U`.
     warmstart : callable(S, U, p) -> (S, U) or None.
         Applied ONLY on the first batch, between covariance accumulation and
         the first Jacobi iterations.
 
     Returns
     -------
-    tr, time_axis, samples : numpy arrays.
+    tr, time_axis, samples, eig : numpy arrays plus the fitted estimator.
     """
     import time
     try:
@@ -562,53 +350,3 @@ def run_online_eig(X, P, G, batch_size, monitor, evr_fn, warmstart=None):
             break
 
     return np.array(tr), np.array(time_axis), np.array(samples), eig
-
-
-# ============================================================
-# WARMUP — trigger numba JIT compilation on all hot paths
-# ============================================================
-
-def warmup(n=8, p=3, n_iter=4, dtype=np.float64):
-    """
-    Run one tiny end-to-end fit to compile every @njit function in this module.
-
-    Call this once before timing — e.g. in the same cell as the SVD class's
-    warmup, mirroring the pattern in benchmarking_3.ipynb:
-
-        op.set_num_threads(op.NUMBA_THREADS)
-        op._init_global_buf(...)
-        _ = fit_safe(...)              # warms online_svd_buffer
-
-        oeb.set_num_threads(oeb.NUMBA_THREADS)
-        oeb.warmup()                   # warms online_eig_buffer
-
-    The defaults (n=8, p=3, n_iter=4) are deliberately tiny — the goal is to
-    compile, not to compute.
-    """
-    rng = np.random.default_rng(0)
-    A = rng.standard_normal((n, n)).astype(dtype)
-    S = (A + A.T) / 2.0   # symmetric
-
-    U = np.eye(n, dtype=dtype)
-    scores = np.empty((p, n), dtype=dtype)
-    scores.fill(NEG_INF32)
-    row_topk_vals = np.empty((p, TOP_K_SCORES), dtype=dtype)
-    row_topk_vals.fill(NEG_INF32)
-    row_topk_idx = np.empty((p, TOP_K_SCORES), dtype=np.int64)
-    row_topk_idx.fill(-1)
-
-    _init_global_buf(n, n, dtype)
-
-    # End-to-end fit_safe call exercises: compute_and_assign_topk_eig,
-    # get_max_topk, jacobi_2x2_rotation, apply_similarity, apply_right_to_U,
-    # refresh_row_topk, refresh_col_topk, _score_one, and recompute_row_topk
-    # (the last one fires when topk gets exhausted; we force it below).
-    fit_safe(S, p, n_iter, U, scores, row_topk_vals, row_topk_idx, TEMP_COL)
-
-    # Force the recompute_row_topk path: blank out a row's topk and refresh.
-    # This is otherwise only hit when refresh_col_topk evicts everything.
-    row_topk_vals[0, :] = NEG_INF32
-    row_topk_idx[0, :] = -1
-    recompute_row_topk(scores, row_topk_vals, row_topk_idx, 0)
-
-    return None

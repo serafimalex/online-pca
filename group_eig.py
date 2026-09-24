@@ -28,8 +28,6 @@ Import:
     import group_eig_buffer as geb
 
 Drop-in for the benchmark notebook:
-    geb.set_num_threads(geb.NUMBA_THREADS)
-    geb.warmup()
     tr, t, s, eig = geb.run_group_eig(X, P=P, G=GROUP_G,
                                        batch_size=ONLINE_BATCH,
                                        monitor=monitor.astype(np.float64),
@@ -40,51 +38,13 @@ import numpy as np
 
 from validation import check_batch, check_init
 
-try:
-    from numba import njit, prange, set_num_threads as _set_num_threads
-    NUMBA_AVAILABLE = True
-except Exception:
-    NUMBA_AVAILABLE = False
-
-    def njit(*args, **kwargs):
-        if len(args) == 1 and callable(args[0]):
-            return args[0]
-        def deco(fn):
-            return fn
-        return deco
-
-    def prange(*args):
-        return range(*args)
-
-    def _set_num_threads(n):
-        return None
-
 
 # ============================================================
-# MODULE-LEVEL CONSTANTS (mirror online_svd_buffer.py / online_eig_buffer.py)
+# MODULE-LEVEL CONSTANTS
 # ============================================================
 
-TEMP_COL = None
-TEMP_ROW = None
-TOP_K_SCORES = 5                    # unused here, kept for API parity
 TOP_CANDIDATES_PER_ROW = 32         # like group_svd.py
-NEG_INF32 = np.float64(-1e30)
 NEG_INF = np.float64(-1e30)
-NUMBA_THREADS = 1
-
-
-def set_num_threads(k):
-    global NUMBA_THREADS
-    NUMBA_THREADS = int(k)
-    if NUMBA_AVAILABLE:
-        _set_num_threads(NUMBA_THREADS)
-
-
-def _init_global_buf(n_rows, n_cols, dtype):
-    """Allocate scratch buffers. Kept for API parity with online_svd_buffer."""
-    global TEMP_COL, TEMP_ROW
-    TEMP_COL = np.zeros(n_rows, dtype=dtype)
-    TEMP_ROW = np.zeros(n_cols, dtype=dtype)
 
 
 # ============================================================
@@ -95,45 +55,38 @@ def _init_global_buf(n_rows, n_cols, dtype):
 #   lambda_max = (S_ii + S_jj)/2 + sqrt(((S_ii - S_jj)/2)^2 + S_ij^2)
 # Score: C_ij = lambda_max - S_ii.
 
-@njit(parallel=True, cache=True)
 def compute_row_top_candidates_eig(S, p, top_vals, top_idxs):
     """
     For each i in [0, p), scan j > i in [0, n) and keep top_m best candidates.
 
     S is symmetric n x n. Writes top_vals (p, top_m) sorted descending
     and top_idxs (p, top_m) with -1 for empty slots.
+
+    The whole (p, n) score grid is built at once, then argpartition takes the
+    top_m of each row: the same result as a per-row insertion scan, but the
+    work happens inside numpy rather than in a Python loop.
     """
     n = S.shape[0]
     top_m = top_vals.shape[1]
 
-    for i in prange(p):
-        # reset
-        for k in range(top_m):
-            top_vals[i, k] = NEG_INF
-            top_idxs[i, k] = -1
+    diag = np.diag(S)
+    di = diag[:p, None]
+    half_dif = 0.5 * (di - diag[None, :])
+    vals = 0.5 * (di + diag[None, :]) + np.sqrt(half_dif * half_dif + S[:p, :] ** 2) - di
+    # j <= i is not a candidate
+    vals[np.arange(n)[None, :] <= np.arange(p)[:, None]] = NEG_INF
 
-        sii = S[i, i]
+    m = min(top_m, n)
+    part = np.argpartition(-vals, m - 1, axis=1)[:, :m]
+    rows = np.arange(p)[:, None]
+    part = part[rows, np.argsort(-vals[rows, part], axis=1)]
 
-        for j in range(i + 1, n):
-            sjj = S[j, j]
-            sij = S[i, j]
-
-            half_sum = 0.5 * (sii + sjj)
-            half_dif = 0.5 * (sii - sjj)
-            radius = np.sqrt(half_dif * half_dif + sij * sij)
-            lmax = half_sum + radius
-
-            val = lmax - sii
-
-            # inline top-m insertion
-            if val > top_vals[i, top_m - 1]:
-                kk = top_m - 1
-                while kk > 0 and val > top_vals[i, kk - 1]:
-                    top_vals[i, kk] = top_vals[i, kk - 1]
-                    top_idxs[i, kk] = top_idxs[i, kk - 1]
-                    kk -= 1
-                top_vals[i, kk] = val
-                top_idxs[i, kk] = j
+    top_vals[:, :] = NEG_INF
+    top_idxs[:, :] = -1
+    picked = vals[rows, part]
+    valid = picked > NEG_INF
+    top_vals[:, :m] = np.where(valid, picked, NEG_INF)
+    top_idxs[:, :m] = np.where(valid, part, -1)
 
 
 def choose_group_from_top_candidates(top_idxs, p, n_active):
@@ -338,8 +291,6 @@ class OnlineGroupEIG:
         self.S_ = np.zeros((n, n), dtype=dtype)
         self.U_ = np.eye(n, dtype=dtype)
 
-        _init_global_buf(n, n, dtype)
-
         self.n_samples_seen_ = 0
         self._first_batch = True
 
@@ -452,26 +403,3 @@ def run_group_eig(X, P, G, batch_size, monitor, evr_fn,
             break
 
     return np.array(tr), np.array(time_axis), np.array(samples), eig
-
-
-# ============================================================
-# WARMUP
-# ============================================================
-
-def warmup(n=8, p=3, n_iter=4, dtype=np.float64):
-    """
-    Run one tiny end-to-end fit to compile every @njit function.
-
-    Call once before timing, mirroring the SVD/EIG pattern in the notebook.
-    """
-    rng = np.random.default_rng(0)
-    A = rng.standard_normal((n, n)).astype(dtype)
-    S = (A + A.T) / 2.0
-
-    U = np.eye(n, dtype=dtype)
-    _init_global_buf(n, n, dtype)
-
-    # Run the full path: compute_row_top_candidates_eig, choose_group, block_eig_update
-    fit_group_eig(S, p, n_iter, U)
-
-    return None

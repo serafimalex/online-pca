@@ -1,22 +1,24 @@
 """
 Input validation shared by the EIG estimators.
 
-These checks exist because the failure modes underneath them are silent rather
-than loud. Three in particular:
+These checks exist because the failure modes underneath them are quiet, or else
+report themselves in a way that points at the wrong place. Three in particular:
 
-  * ``p > n`` makes the numba score kernels index past the end of ``S``. They are
-    ``@njit(parallel=True)``, and numba's bounds checking does not apply to
-    parallel loops, so the out-of-bounds read is never reported -- it just
-    returns whatever happens to be in adjacent memory.
+  * ``p > n`` does not fail where you would expect. Numpy slicing clamps, so
+    ``S[:p, :]`` silently yields n rows, and the mistake only surfaces several
+    lines later as an ``IndexError`` about a boolean mask shape -- which says
+    nothing about p. Checking up front names the actual error.
 
-  * A single NaN or inf in a batch poisons every entry of ``S`` within one
-    update. Pivot selection compares with ``>``, which is always False against
-    NaN, so no rotation is ever applied again: the estimator silently stops
-    learning while still returning an orthonormal-looking ``U_``.
+  * A single NaN or inf in a batch poisons essentially every entry of ``S``
+    within one update, and nothing raises. What happens next differs by variant:
+    pairwise selects the NaN as a pivot (``np.argmax`` returns the index of a
+    NaN) and carries it into ``U_``; group leaves ``U_`` looking clean and
+    orthonormal on top of an ``S`` that is entirely NaN. Neither reports a
+    problem, and neither is learning anything after that point.
 
   * A 1-D batch is a legal matmul against ``U_.T``, so ``Y @ Y.T`` collapses to a
-    scalar that broadcasts over all of ``S``. The state is corrupted before the
-    shape error surfaces further down.
+    0-d scalar that broadcasts over all of ``S``. The state is corrupted before
+    any shape error surfaces further down.
 """
 
 import numpy as np
@@ -56,7 +58,8 @@ def check_batch(X, n, dtype, check_finite=True):
         bad = "NaN" if np.isnan(X).any() else "inf"
         raise ValueError(
             f"X_batch contains {bad}. A single non-finite value poisons the whole "
-            "second-moment matrix and silently halts learning; clean the batch "
-            "first, or pass check_finite=False if you have handled this yourself."
+            "second-moment matrix within one update, and nothing downstream "
+            "raises; clean the batch first, or pass check_finite=False if you "
+            "have handled this yourself."
         )
     return X
