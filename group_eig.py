@@ -37,10 +37,14 @@ NEG_INF = np.float64(-1e30)
 def _gram(X, S=None):
     """
     Form/add X X.T using the same NumPy BLAS runtime as the other matmuls.
+
+    X.T is copied so NumPy calls plain GEMM instead of its SYRK-and-mirror path
+    for `X @ X.T`, which was slower with OpenBLAS here. GEMM computes both
+    triangles, so the result is symmetric only up to rounding (~1e-16).
     """
     if not (X.flags.c_contiguous or X.flags.f_contiguous):
         X = np.ascontiguousarray(X)
-    C = X @ X.T
+    C = X @ np.ascontiguousarray(X.T)
     if S is None:
         return C
     S += C
