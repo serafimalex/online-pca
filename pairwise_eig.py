@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.linalg.blas import drot
 
 from validation import check_batch, check_init
 
@@ -109,27 +110,43 @@ def jacobi_2x2_rotation(sii, sjj, sij):
     return G
 
 
+def apply_o2(x, y, G):
+    """
+    In-place [x, y] <- [x, y] @ G for two vectors x, y and a 2x2 orthogonal G,
+    either a rotation [[c, -s], [s, c]] or a reflection [[c, s], [s, -c]].
+
+    Uses BLAS drot, which computes x' = c x + s y, y' = c y - s x (the rotation
+    case); the reflection only flips the sign of y'. When x and y are
+    contiguous drot works in place; otherwise it returns copies, which are
+    written back.  Cost: O(n)
+    """
+    xr, yr = drot(x, y, G[0, 0], G[1, 0], overwrite_x=1, overwrite_y=1)
+    if G[0, 0] * G[1, 1] - G[0, 1] * G[1, 0] < 0.0:
+        np.negative(yr, out=yr)
+    if not np.shares_memory(xr, x):
+        x[:] = xr
+        y[:] = yr
+
+
 def apply_similarity(S, i, j, G):
     """
     In-place similarity transform S <- G^T S G acting only on rows/cols i, j.
 
-    G is 2x2 with rows indexed (i, j). This touches rows i and j (left mult by
-    G^T) and cols i and j (right mult by G).  cost: O(n)
+    S must be symmetric. Rows i and j are rotated with drot (contiguous in C
+    order), then copied into columns i and j, which is what the right
+    multiplication by G gives outside the 2x2 block. The block itself is
+    G^T B G = diag(lambda_max, lambda_min) and is written in directly.
+    cost: O(n)
     """
-    g00, g01, g10, g11 = G[0, 0], G[0, 1], G[1, 0], G[1, 1]
+    B = np.array([[S[i, i], S[i, j]], [S[j, i], S[j, j]]])
+    D = G.T @ B @ G
 
-    # --- Left multiply: S' = G^T S, affects rows i and j only ---
-    row_i = S[i, :].copy()
-    row_j = S[j, :].copy()
-    S[i, :] = g00 * row_i + g10 * row_j
-    S[j, :] = g01 * row_i + g11 * row_j
+    apply_o2(S[i, :], S[j, :], G)
+    S[:, i] = S[i, :]
+    S[:, j] = S[j, :]
 
-    # --- Right multiply: S'' = (G^T S) G, affects cols i and j only ---
-    col_i = S[:, i].copy()
-    col_j = S[:, j].copy()
-    S[:, i] = g00 * col_i + g10 * col_j
-    S[:, j] = g01 * col_i + g11 * col_j
-
+    S[i, i] = D[0, 0]
+    S[j, j] = D[1, 1]
     # Force the off-diagonals (i,j) and (j,i) to exact zero - cleaner than
     # relying on floating-point cancellation, and keeps the score grid honest.
     S[i, j] = 0.0
@@ -137,12 +154,11 @@ def apply_similarity(S, i, j, G):
 
 
 def apply_right_to_U(U, i, j, G):
-    """In-place U <- U G, only affects columns i, j of U.  Cost: O(n)."""
-    g00, g01, g10, g11 = G[0, 0], G[0, 1], G[1, 0], G[1, 1]
-    col_i = U[:, i].copy()
-    col_j = U[:, j].copy()
-    U[:, i] = g00 * col_i + g10 * col_j
-    U[:, j] = g01 * col_i + g11 * col_j
+    """In-place U <- U G, only affects columns i, j of U.  Cost: O(n).
+
+    Fastest when U is Fortran-ordered (columns contiguous); works for any layout.
+    """
+    apply_o2(U[:, i], U[:, j], G)
 
 
 # ============================================================
@@ -234,7 +250,9 @@ class OnlineEIG:
         self.check_finite = check_finite
 
         self.S_ = np.zeros((n, n), dtype=dtype)
-        self.U_ = np.eye(n, dtype=dtype)
+        # Column-major: the rotations update columns of U, which drot can then
+        # do in place.
+        self.U_ = np.eye(n, dtype=dtype, order="F")
 
         self.n_samples_seen_ = 0
         self._first_batch = True
