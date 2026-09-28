@@ -123,20 +123,11 @@ def symmetric_warmstart_eig(S, u, p):
     via Householder, accumulate the rotation Q into u (u <- u @ Q), and apply
     Q^T S Q similarity transform in place.
 
-    The EIG-side analog of `symmetric_warmstart`. Differs in that the input
-    is already the symmetric matrix S (no x_batch @ x_batch.T step), so this
-    is strictly cheaper.
+    Delegates to eig_warmstart.householder_warmstart (exact p-step construction,
+    no small-column threshold). For its options (krylov_dim, ritz, start) use
+    eig_warmstart.HouseholderWarmStart directly.
 
     Mutates S and u in place. Returns (S, u).
     """
-    n = S.shape[0]
-    if not S.flags["F_CONTIGUOUS"]:
-        S_F = np.asfortranarray(S)
-    else:
-        S_F = S
-    Q = np.eye(n, dtype=S.dtype, order="F")
-    partial_symmetric_householder_inplace(S_F, p, Q)
-    if S_F is not S:
-        S[:] = S_F
-    u[:] = u @ Q
-    return S, u
+    from eig_warmstart import householder_warmstart
+    return householder_warmstart(S, u, p)

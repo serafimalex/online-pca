@@ -8,6 +8,7 @@ pandas>=2.0          # dataset parsing in data.py
 matplotlib>=3.8
 tqdm>=4.66
 joblib>=1.3
+threadpoolctl>=3.1   # eig_warmstart.py limits BLAS threads (also pulled in by scikit-learn)
 ipykernel>=6.29
 line_profiler        # unused @profile import at the top of pairwise_svd.py
 

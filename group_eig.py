@@ -1,5 +1,5 @@
 """
-group_eig_buffer.py
+group_eig.py
 
 Group / Block Online EIG.
 
@@ -17,21 +17,6 @@ Algorithm (per group iteration):
            S[idx, :]   = G_local^T @ S[idx, :]
            S[:, idx]   = S[:, idx]   @ G_local
            U[:, idx]   = U[:, idx]   @ G_local
-
-Streaming wrapper:
-    OnlineGroupEIG maintains (S, U). Each batch:
-        Y = U^T @ X_new
-        S += Y @ Y^T
-        run k_per_batch group iterations on S
-
-Import:
-    import group_eig_buffer as geb
-
-Drop-in for the benchmark notebook:
-    tr, t, s, eig = geb.run_group_eig(X, P=P, G=GROUP_G,
-                                       batch_size=ONLINE_BATCH,
-                                       monitor=monitor.astype(np.float64),
-                                       evr_fn=evr_from_U)
 """
 
 import numpy as np
