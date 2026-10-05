@@ -19,8 +19,9 @@ line_profiler        # unused @profile import at the top of pairwise_svd.py
 torch>=2.0
 torchvision>=0.15
 
-# Dataset parsing extra (data.py imports it lazily, only isolet needs it):
+# Dataset parsing extras (data.py imports them lazily, only for one dataset each):
 unlzw3               # isolet (.Z / LZW archives)
+pyarrow              # dbpedia_ada (parquet shards)
 
 # PyParSVD baseline. Its package __init__ pulls in the parallel backend even
 # when only ParSVD_Serial is used, so these are required just to import it.

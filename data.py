@@ -243,6 +243,30 @@ def _build_news20():
     return vec.fit_transform(data.data).toarray().astype(np.float32)
 
 
+def _build_dbpedia_ada(shards=(0,)):
+    """DBpedia entities, OpenAI text-embedding-ada-002 -> (38462, 1536) per shard.
+
+    From the Hugging Face dataset KShivendu/dbpedia-entities-openai-1M (MIT
+    license): the first 1M entities of BEIR's DBpedia-entity corpus, title +
+    text embedded with OpenAI's API in June 2023. The 1M rows come as 26
+    parquet shards of ~367 MB each (embeddings plus text); shard 0 alone covers
+    the benchmarks. Pass more shard indices (0..25) for a larger sample, e.g.
+    ``build("dbpedia_ada", shards=range(26), force=True)``. Rows are unit-norm.
+    """
+    import pyarrow.parquet as pq
+
+    raw = _raw("dbpedia_ada")
+    base = ("https://huggingface.co/api/datasets/KShivendu/"
+            "dbpedia-entities-openai-1M/parquet/default/train/")
+    blocks = []
+    for s in shards:
+        path = _download(f"{base}{s}.parquet", os.path.join(raw, f"{s}.parquet"))
+        # Only the embedding column; the title/text columns are most of the file.
+        col = pq.read_table(path, columns=["openai"]).column("openai").combine_chunks()
+        blocks.append(col.flatten().to_numpy().astype(np.float32).reshape(len(col), -1))
+    return np.vstack(blocks)
+
+
 def _build_synthetic(n_samples=100_000, n_features=256, rank=30, noise_std=0.1, seed=42):
     """Low-rank Gaussian data plus isotropic noise -> (100000, 256)."""
     rng = np.random.default_rng(seed)
@@ -284,6 +308,7 @@ BUILDERS = {
     "gas_sensor":     _build_gas_sensor,
     "har":            _build_har,
     "news20":         _build_news20,
+    "dbpedia_ada":    _build_dbpedia_ada,
     "synthetic":      _build_synthetic,
 }
 
